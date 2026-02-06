@@ -1,0 +1,28 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: configs.controlplane.cluster.x-k8s.io
+  labels:
+    app.kubernetes.io/component: ansible-control-plane
+spec:
+  group: controlplane.cluster.x-k8s.io
+  names:
+    kind: Config
+    listKind: ConfigList
+    plural: configs
+    singular: config
+    shortNames:
+      - conf
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

@@ -1,0 +1,279 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+  name: ansibleconfigtemplates.bootstrap.cluster.x-k8s.io
+spec:
+  group: bootstrap.cluster.x-k8s.io
+  names:
+    categories:
+    - cluster-api
+    kind: AnsibleConfigTemplate
+    listKind: AnsibleConfigTemplateList
+    plural: ansibleconfigtemplates
+    singular: ansibleconfigtemplate
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - description: Time duration since creation of AnsibleConfigTemplate
+      jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AnsibleConfigTemplate defines the Schema for reusable Ansible bootstrap configuration templates.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AnsibleConfigTemplateSpec defines the desired state of AnsibleConfigTemplate.
+            properties:
+              template:
+                description: AnsibleConfigTemplateResource defines the Template structure.
+                properties:
+                  metadata:
+                    description: |-
+                      Standard object's metadata.
+                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Annotations is an unstructured key value map stored with a resource that may be
+                          set by external tools to store and retrieve arbitrary metadata. They are not
+                          queryable and should be preserved when modifying objects.
+                          More info: http://kubernetes.io/docs/user-guide/annotations
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Map of string keys and values that can be used to organize and categorize
+                          (scope and select) objects. May match selectors of replication controllers
+                          and services.
+                          More info: http://kubernetes.io/docs/user-guide/labels
+                        type: object
+                    type: object
+                  spec:
+                    description: AnsibleConfigSpec defines the desired state of AnsibleConfig.
+                    properties:
+                      certRef:
+                        description: CertRef points to the secret containing tls.crt
+                          and tls.key which must be baked into the node before ansible
+                          runs.
+                        properties:
+                          name:
+                            description: name is unique within a namespace to reference
+                              a secret resource.
+                            type: string
+                          namespace:
+                            description: namespace defines the space within which
+                              the secret name must be unique.
+                            type: string
+                        type: object
+                        x-kubernetes-map-type: atomic
+                      clusterOperationTemplate:
+                        description: ClusterOperationTemplate defines the parameters
+                          required to compose a kubean ClusterOperation resource automatically.
+                        properties:
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            description: Annotations propagated to the created object.
+                            type: object
+                          apiVersion:
+                            description: APIVersion of the target resource, e.g. clusterops.kubean.io/v1alpha1.
+                            type: string
+                          kind:
+                            description: Kind of the target resource, e.g. ClusterOperation.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels propagated to the created object.
+                            type: object
+                          namespace:
+                            description: Namespace of the resource. Defaults to the
+                              namespace of the AnsibleConfig.
+                            type: string
+                          spec:
+                            description: Spec encodes the spec body that should be
+                              copied to the created object.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        required:
+                        - apiVersion
+                        - kind
+                        type: object
+                      clusterOpsRef:
+                        description: |-
+                          ClusterOpsRef contains the template required to create a kubean ClusterOperation resource.
+                          Deprecated: prefer ClusterOperationTemplate for auto-generated kubean resources.
+                        properties:
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            description: Annotations propagated to the created object.
+                            type: object
+                          apiVersion:
+                            description: APIVersion of the target resource, e.g. cluster.kubean.io/v1alpha1.
+                            type: string
+                          kind:
+                            description: Kind of the target resource, e.g. Cluster
+                              or ClusterOperation.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels propagated to the created object.
+                            type: object
+                          name:
+                            description: Name of the resource to be created.
+                            type: string
+                          namespace:
+                            description: Namespace of the resource. Defaults to the
+                              namespace of the AnsibleConfig.
+                            type: string
+                          spec:
+                            description: Spec encodes the spec body that should be
+                              copied to the created object.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        required:
+                        - apiVersion
+                        - kind
+                        - name
+                        type: object
+                      clusterRef:
+                        description: |-
+                          ClusterRef contains the template required to create a kubean Cluster resource.
+                          Deprecated: prefer ClusterTemplate for auto-generated kubean resources.
+                        properties:
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            description: Annotations propagated to the created object.
+                            type: object
+                          apiVersion:
+                            description: APIVersion of the target resource, e.g. cluster.kubean.io/v1alpha1.
+                            type: string
+                          kind:
+                            description: Kind of the target resource, e.g. Cluster
+                              or ClusterOperation.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels propagated to the created object.
+                            type: object
+                          name:
+                            description: Name of the resource to be created.
+                            type: string
+                          namespace:
+                            description: Namespace of the resource. Defaults to the
+                              namespace of the AnsibleConfig.
+                            type: string
+                          spec:
+                            description: Spec encodes the spec body that should be
+                              copied to the created object.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        required:
+                        - apiVersion
+                        - kind
+                        - name
+                        type: object
+                      clusterTemplate:
+                        description: ClusterTemplate defines the parameters required
+                          to compose a kubean Cluster resource automatically.
+                        properties:
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            description: Annotations propagated to the created object.
+                            type: object
+                          apiVersion:
+                            description: APIVersion of the target resource, e.g. cluster.kubean.io/v1alpha1.
+                            type: string
+                          kind:
+                            description: Kind of the target resource, e.g. Cluster.
+                            type: string
+                          labels:
+                            additionalProperties:
+                              type: string
+                            description: Labels propagated to the created object.
+                            type: object
+                          namespace:
+                            description: Namespace of the resource. Defaults to the
+                              namespace of the AnsibleConfig.
+                            type: string
+                          spec:
+                            description: Spec encodes the spec body that should be
+                              copied to the created object.
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                        required:
+                        - apiVersion
+                        - kind
+                        type: object
+                      files:
+                        description: Files specifies extra files to be rendered on
+                          the target host during cloud-init generation.
+                        items:
+                          description: File describes an additional file rendered
+                            by the bootstrap script.
+                          properties:
+                            content:
+                              description: Content is the inline file contents.
+                              type: string
+                            owner:
+                              description: Owner defines the file owner in the form
+                                user:group. Defaults to root:root.
+                              type: string
+                            path:
+                              description: Path is the full path where the file should
+                                be written.
+                              type: string
+                            permissions:
+                              description: Permissions is an octal string such as
+                                0600.
+                              type: string
+                          required:
+                          - content
+                          - path
+                          type: object
+                        type: array
+                      role:
+                        description: Role captures the desired Ansible groups for
+                          the current node.
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                type: object
+            required:
+            - template
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources: {}

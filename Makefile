@@ -350,6 +350,28 @@ generate-manifests-kubeadm-bootstrap: $(CONTROLLER_GEN) ## Generate manifests e.
 		output:webhook:dir=./bootstrap/kubeadm/config/webhook \
 		webhook
 
+.PHONY: generate-manifests-ansible-bootstrap
+generate-manifests-ansible-bootstrap: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc. for ansible bootstrap
+	$(MAKE) clean-generated-yaml SRC_DIRS="./bootstrap/ansible/config/crd/bases"
+	$(CONTROLLER_GEN) \
+		paths=./bootstrap/ansible \
+		paths=./bootstrap/ansible/api/... \
+		crd:crdVersions=v1 \
+		rbac:roleName=manager-role \
+		output:crd:dir=./bootstrap/ansible/config/crd/bases \
+		output:rbac:dir=./bootstrap/ansible/config/rbac
+
+.PHONY: generate-manifests-ansible-control-plane
+generate-manifests-ansible-control-plane: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc. for ansible bootstrap
+	$(MAKE) clean-generated-yaml SRC_DIRS="./controlplane/ansible/config/crd/bases"
+	$(CONTROLLER_GEN) \
+		paths=./controlplane/ansible \
+		paths=./controlplane/ansible/api/... \
+		crd:crdVersions=v1 \
+		rbac:roleName=manager-role \
+		output:crd:dir=./controlplane/ansible/config/crd/bases \
+		output:rbac:dir=./controlplane/ansible/config/rbac
+
 .PHONY: generate-manifests-kubeadm-control-plane
 generate-manifests-kubeadm-control-plane: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc. for kubeadm control plane
 	$(MAKE) clean-generated-yaml SRC_DIRS="./controlplane/kubeadm/config/crd/bases,./controlplane/kubeadm/config/webhook/manifests.yaml"
@@ -407,6 +429,20 @@ generate-go-deepcopy-core: $(CONTROLLER_GEN) ## Generate deepcopy go code for co
 		paths=./util/test/builder/... \
 		paths=./util/deprecated/v1beta1/test/builder/...
 
+.PHONY: generate-go-deepcopy-ansible-bootstrap
+generate-go-deepcopy-ansible-bootstrap: $(CONTROLLER_GEN) ## Generate deepcopy go code for ansible bootstrap
+	$(MAKE) clean-generated-deepcopy SRC_DIRS="./bootstrap/ansible/api"
+	$(CONTROLLER_GEN) \
+		object:headerFile=./hack/boilerplate/boilerplate.generatego.txt \
+		paths=./bootstrap/ansible/api/...
+
+
+.PHONY: generate-go-deepcopy-ansible-control-plane
+generate-go-deepcopy-ansible-control-plane: $(CONTROLLER_GEN) ## Generate deepcopy go code for ansible bootstrap
+	$(MAKE) clean-generated-deepcopy SRC_DIRS="./controlplane/ansible/api"
+	$(CONTROLLER_GEN) \
+		object:headerFile=./hack/boilerplate/boilerplate.generatego.txt \
+		paths=./controlplane/ansible/api/...
 .PHONY: generate-go-deepcopy-kubeadm-bootstrap
 generate-go-deepcopy-kubeadm-bootstrap: $(CONTROLLER_GEN) ## Generate deepcopy go code for kubeadm bootstrap
 	$(MAKE) clean-generated-deepcopy SRC_DIRS="./api/bootstrap/kubeadm,./bootstrap/kubeadm/types"
