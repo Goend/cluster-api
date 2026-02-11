@@ -44,12 +44,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	ansiblebootstrapcontrollers "sigs.k8s.io/cluster-api/bootstrap/ansible/internal/controllers"
 	"sigs.k8s.io/cluster-api/bootstrap/ansible/internal/locking"
 	"sigs.k8s.io/cluster-api/controllers/remote"
-	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/flags"
 	"sigs.k8s.io/cluster-api/version"
@@ -73,15 +72,13 @@ var (
 	restConfigQPS               float32
 	restConfigBurst             int
 	healthAddr                  string
-	tlsOptions                  = flags.TLSOptions{}
-	diagnosticsOptions          = flags.DiagnosticsOptions{}
+	managerOptions              = flags.ManagerOptions{}
 	logOptions                  = logs.NewOptions()
 )
 
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = clusterv1.AddToScheme(scheme)
-	_ = expv1.AddToScheme(scheme)
 	_ = bootstrapv1.AddToScheme(scheme)
 }
 
@@ -124,8 +121,7 @@ func InitFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&healthAddr, "health-addr", ":9440",
 		"The address the health endpoint binds to.")
 
-	flags.AddDiagnosticsOptions(fs, &diagnosticsOptions)
-	flags.AddTLSOptions(fs, &tlsOptions)
+	flags.AddManagerOptions(fs, &managerOptions)
 
 	feature.MutableGates.AddFlag(fs)
 }
@@ -158,7 +154,11 @@ func main() {
 	restConfig.Burst = restConfigBurst
 	restConfig.UserAgent = remote.DefaultClusterAPIUserAgent(controllerName)
 
-	diagnosticsOpts := flags.GetDiagnosticsOptions(diagnosticsOptions)
+	_, metricsOptions, err := flags.GetManagerOptions(managerOptions)
+	if err != nil {
+		setupLog.Error(err, "unable to configure manager options")
+		os.Exit(1)
+	}
 
 	var watchNamespaces map[string]cache.Config
 	if watchNamespace != "" {
@@ -184,7 +184,7 @@ func main() {
 		LeaderElectionResourceLock: resourcelock.LeasesResourceLock,
 		HealthProbeBindAddress:     healthAddr,
 		PprofBindAddress:           profilerAddress,
-		Metrics:                    diagnosticsOpts,
+		Metrics:                    *metricsOptions,
 		Cache: cache.Options{
 			DefaultNamespaces: watchNamespaces,
 			SyncPeriod:        &syncPeriod,

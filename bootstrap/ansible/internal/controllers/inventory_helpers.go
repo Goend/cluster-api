@@ -2,17 +2,17 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
-	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
+	"sigs.k8s.io/cluster-api/internal/ansiblecontract"
 )
 
 type inventoryNode struct {
@@ -20,6 +20,8 @@ type inventoryNode struct {
 	IP      string
 	orderBy string
 }
+
+var errAnchorMachinesUnavailable = errors.New("ansible anchor machines not ready")
 
 func formatInventoryHosts(nodes []inventoryNode) []string {
 	lines := []string{}
@@ -136,18 +138,13 @@ func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope
 	}
 
 	hostNode := newInventoryNode(machine, ip)
-	acpStatus, err := r.lookupControlPlaneStatus(ctx, scope)
-	if err != nil {
-		return "", err
-	}
-
 	isFirstMasterCluster := scope.ClusterOperationPlan.ActionType == bootstrapv1.ClusterOperationActionCluster
 	lines := []string{
 		"## Configure 'ip' variable to bind kubernetes services on a",
 		"## different ip than the default iface",
 	}
 	hostEntries := []inventoryNode{hostNode}
-	primaryAnchor, etcdAnchors, err := r.resolveInitialInventoryNodes(ctx, scope, acpStatus)
+	primaryAnchor, etcdAnchors, err := r.resolveInitialInventoryNodes(ctx, scope)
 	if err != nil {
 		return "", err
 	}
@@ -231,25 +228,19 @@ func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope
 	return strings.Join(lines, "\n"), nil
 }
 
-func (r *AnsibleConfigReconciler) resolveInitialInventoryNodes(ctx context.Context, scope *Scope, status *controlplanev1alpha1.AnsibleControlPlaneStatus) (*inventoryNode, []inventoryNode, error) {
-	var controlPlaneNode *inventoryNode
-	if status.ControlPlaneInitialMachine != nil {
-		machine, err := machineFromReference(ctx, r.Client, scope, status.ControlPlaneInitialMachine)
-		if err != nil {
-			return nil, nil, err
-		}
-		if node, ok := inventoryNodeFromMachine(machine); ok {
-			controlPlaneNode = &node
-		}
+func (r *AnsibleConfigReconciler) resolveInitialInventoryNodes(ctx context.Context, scope *Scope) (*inventoryNode, []inventoryNode, error) {
+	primaryMachine, etcdMachines, err := r.findAnchorMachines(ctx, scope)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	etcdNodes := make([]inventoryNode, 0, len(status.EtcdInitialMachines))
-	for i := range status.EtcdInitialMachines {
-		ref := status.EtcdInitialMachines[i]
-		machine, err := machineFromReference(ctx, r.Client, scope, &ref)
-		if err != nil {
-			return controlPlaneNode, nil, err
-		}
+	var controlPlaneNode *inventoryNode
+	if node, ok := inventoryNodeFromMachine(primaryMachine); ok {
+		controlPlaneNode = &node
+	}
+
+	etcdNodes := make([]inventoryNode, 0, len(etcdMachines))
+	for _, machine := range etcdMachines {
 		if node, ok := inventoryNodeFromMachine(machine); ok {
 			etcdNodes = addGroupMember(etcdNodes, node)
 		}
@@ -262,21 +253,35 @@ func (r *AnsibleConfigReconciler) resolveInitialInventoryNodes(ctx context.Conte
 	return controlPlaneNode, etcdNodes, nil
 }
 
-func (r *AnsibleConfigReconciler) lookupControlPlaneStatus(ctx context.Context, scope *Scope) (*controlplanev1alpha1.AnsibleControlPlaneStatus, error) {
-	ref := scope.Cluster.Spec.ControlPlaneRef
-	if ref == nil || ref.Kind != "AnsibleControlPlane" || ref.APIVersion != controlplanev1alpha1.GroupVersion.String() {
-		return &controlplanev1alpha1.AnsibleControlPlaneStatus{}, nil
+func (r *AnsibleConfigReconciler) findAnchorMachines(ctx context.Context, scope *Scope) (*clusterv1.Machine, []*clusterv1.Machine, error) {
+	machineList := &clusterv1.MachineList{}
+	selectors := []client.ListOption{
+		client.InNamespace(scope.Cluster.Namespace),
+		client.MatchingLabels{
+			clusterv1.ClusterNameLabel: scope.Cluster.Name,
+		},
 	}
-	namespace := ref.Namespace
-	if namespace == "" {
-		namespace = scope.Cluster.Namespace
+	if err := r.Client.List(ctx, machineList, selectors...); err != nil {
+		return nil, nil, err
 	}
-	acp := &controlplanev1alpha1.AnsibleControlPlane{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, acp); err != nil {
-		if apierrors.IsNotFound(err) {
-			return &controlplanev1alpha1.AnsibleControlPlaneStatus{}, nil
+
+	var primary *clusterv1.Machine
+	etcdMachines := []*clusterv1.Machine{}
+
+	for i := range machineList.Items {
+		machine := machineList.Items[i].DeepCopy()
+		annotations := machine.GetAnnotations()
+		if annotations[ansiblecontract.ControlPlaneInitialMachineAnnotation] == ansiblecontract.AnnotationTrueValue() {
+			primary = machine
 		}
-		return nil, err
+		if annotations[ansiblecontract.EtcdInitialMachineAnnotation] == ansiblecontract.AnnotationTrueValue() {
+			etcdMachines = append(etcdMachines, machine)
+		}
 	}
-	return &acp.Status, nil
+
+	if primary == nil && len(etcdMachines) == 0 {
+		return nil, nil, errAnchorMachinesUnavailable
+	}
+
+	return primary, etcdMachines, nil
 }

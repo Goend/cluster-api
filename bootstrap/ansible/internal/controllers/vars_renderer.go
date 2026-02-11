@@ -5,16 +5,14 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/external"
 	configrenderer "sigs.k8s.io/cluster-api/controlplane/ansible/upstream/config"
 )
 
@@ -49,35 +47,33 @@ type fieldMapping struct {
 
 var (
 	clusterInfraStringFields = []fieldMapping{
-		{"kube_network_plugin", []string{"status", "network", "plugin"}},
-		{"cilium_openstack_project_id", []string{"status", "network", "openStack", "projectID"}},
-		{"cilium_openstack_default_subnet_id", []string{"status", "network", "openStack", "defaultSubnetID"}},
-		{"master_virtual_vip", []string{"status", "loadBalancer", "controlPlane", "vip"}},
-		{"ingress_virtual_vip", []string{"status", "loadBalancer", "ingress", "vip"}},
-		{"keepalived_interface", []string{"status", "network", "interface", "default"}},
-		{"harbor_addr", []string{"status", "loadBalancer", "ingress", "vip"}},
-		{"cloud_master_vip", []string{"status", "platform", "controlPlaneVIP"}},
-		{"openstack_auth_domain", []string{"status", "platform", "openStack", "keystoneEndpoint"}},
-		{"openstack_cinder_domain", []string{"status", "platform", "openStack", "cinderEndpoint"}},
-		{"openstack_nova_domain", []string{"status", "platform", "openStack", "novaEndpoint"}},
-		{"openstack_neutron_domain", []string{"status", "platform", "openStack", "neutronEndpoint"}},
-		{"openstack_user_name", []string{"spec", "credentials", "openStack", "username"}},
-		{"openstack_project_name", []string{"status", "platform", "openStack", "project"}},
-		{"openstack_project_domain_name", []string{"status", "platform", "openStack", "projectDomain"}},
-		{"openstack_user_app_cred_name", []string{"status", "platform", "openStack", "applicationCredentialName"}},
-		{"openstack_region_name", []string{"status", "platform", "openStack", "region"}},
-		{"ntp_server", []string{"status", "network", "timeServer"}},
-		{"vip_mgmt", []string{"status", "loadBalancer", "management", "vip"}},
-		{"flannel_interface", []string{"status", "network", "interface", "flannel"}},
+		{"kube_network_plugin", []string{"spec", "extensions", "networking", "kubeNetworkPlugin"}},
+		{"cilium_openstack_project_id", []string{"status", "extensions", "networking", "cilium", "projectID"}},
+		{"cilium_openstack_default_subnet_id", []string{"status", "extensions", "networking", "cilium", "defaultSubnetID"}},
+		{"master_virtual_vip", []string{"status", "extensions", "loadBalancers", "controlPlane", "vip"}},
+		{"ingress_virtual_vip", []string{"status", "extensions", "loadBalancers", "ingress", "vip"}},
+		{"harbor_addr", []string{"status", "extensions", "loadBalancers", "ingress", "vip"}},
+		{"cloud_master_vip", []string{"status", "extensions", "openStack", "mgmt"}},
+		{"openstack_auth_domain", []string{"status", "extensions", "openStack", "keystone"}},
+		{"openstack_cinder_domain", []string{"status", "extensions", "openStack", "cinder"}},
+		{"openstack_nova_domain", []string{"status", "extensions", "openStack", "nova"}},
+		{"openstack_neutron_domain", []string{"status", "extensions", "openStack", "neutron"}},
+		{"openstack_project_name", []string{"status", "extensions", "openStack", "project"}},
+		{"openstack_project_domain_name", []string{"status", "extensions", "openStack", "projectDomain"}},
+		{"openstack_region_name", []string{"status", "extensions", "openStack", "region"}},
+		{"ntp_server", []string{"status", "extensions", "platform", "ntp", "server"}},
+		{"vip_mgmt", []string{"status", "extensions", "platform", "management", "vip"}},
+		{"flannel_interface", []string{"spec", "extensions", "networkInterfaces", "flannel"}},
 	}
 	clusterInfraBoolFields = []fieldMapping{
-		{"vpc_cni_webhook_enable", []string{"spec", "network", "features", "vpcCniWebhook"}},
+		{"vpc_cni_webhook_enable", []string{"status", "extensions", "networking", "cilium", "webhookEnable"}},
 	}
 	clusterInfraSliceFields = []fieldMapping{
-		{"cilium_openstack_security_group_ids", []string{"status", "network", "openStack", "securityGroupIDs"}},
+		{"cilium_openstack_security_group_ids", []string{"status", "extensions", "networking", "cilium", "securityGroupIDs"}},
 	}
-	machineInfraNodeResourcesPath = []string{"spec", "resources", "reserved"}
-	configGVR                     = schema.GroupVersionResource{
+	machineInfraNodeResourcesPath      = []string{"status", "extensions", "nodeResources", "reserved"}
+	machineKeepalivedSpecPath          = []string{"spec", "extensions", "networkInterfaces", "keepalived"}
+	configGVR                          = schema.GroupVersionResource{
 		Group:    "controlplane.cluster.x-k8s.io",
 		Version:  "v1alpha1",
 		Resource: "configs",
@@ -144,18 +140,16 @@ func (r *AnsibleConfigReconciler) buildInfrastructureVars(ctx context.Context, s
 		return result, nil
 	}
 
-	if scope.Cluster.Spec.InfrastructureRef != nil {
-		infraObj, err := r.fetchObjectForRef(ctx, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
+	if scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+		infraObj, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
 		if err != nil {
 			return nil, err
 		}
 		if infraObj != nil {
-			applyStringMappings(result, infraObj.Object, clusterInfraStringFields)
-			applyBoolMappings(result, infraObj.Object, clusterInfraBoolFields)
-			applySliceMappings(result, infraObj.Object, clusterInfraSliceFields)
-			if err := r.assignOpenStackSecret(ctx, scope, infraObj, result); err != nil {
-				return nil, err
-			}
+			obj := infraObj.UnstructuredContent()
+			applyStringMappings(result, obj, clusterInfraStringFields)
+			applyBoolMappings(result, obj, clusterInfraBoolFields)
+			applySliceMappings(result, obj, clusterInfraSliceFields)
 		}
 	}
 
@@ -165,6 +159,12 @@ func (r *AnsibleConfigReconciler) buildInfrastructureVars(ctx context.Context, s
 	}
 	if len(nodeResources) > 0 {
 		result["node_resources"] = nodeResources
+	}
+
+	if keepalived, err := r.machineKeepalivedInterface(ctx, machine); err != nil {
+		return nil, err
+	} else if keepalived != "" {
+		result["keepalived_interface"] = keepalived
 	}
 
 	return result, nil
@@ -189,13 +189,14 @@ func (r *AnsibleConfigReconciler) loadConfigSection(ctx context.Context, scope *
 
 func buildMachineVars(machine *clusterv1.Machine) map[string]interface{} {
 	result := map[string]interface{}{}
-	if machine.Spec.Version != nil {
-		result["kube_version"] = *machine.Spec.Version
-		result["hyperkube_image_tag"] = *machine.Spec.Version
-	} else {
+	version := machine.Spec.Version
+	if version == "" {
 		result["kube_version"] = ""
 		result["hyperkube_image_tag"] = ""
+		return result
 	}
+	result["kube_version"] = version
+	result["hyperkube_image_tag"] = version
 	return result
 }
 
@@ -239,14 +240,15 @@ func defaultFixedConfig() map[string]interface{} {
 
 func defaultBusinessConfig(scope *Scope) map[string]interface{} {
 	result := map[string]interface{}{}
-	if scope != nil && scope.Cluster != nil && scope.Cluster.Spec.ClusterNetwork != nil {
-		cn := scope.Cluster.Spec.ClusterNetwork
-		if len(cn.Services.CIDRBlocks) > 0 {
-			result["kube_service_addresses"] = cn.Services.CIDRBlocks[0]
-		}
-		if len(cn.Pods.CIDRBlocks) > 0 {
-			result["kube_pods_subnet"] = cn.Pods.CIDRBlocks[0]
-		}
+	if scope == nil || scope.Cluster == nil {
+		return result
+	}
+	cn := scope.Cluster.Spec.ClusterNetwork
+	if len(cn.Services.CIDRBlocks) > 0 {
+		result["kube_service_addresses"] = cn.Services.CIDRBlocks[0]
+	}
+	if len(cn.Pods.CIDRBlocks) > 0 {
+		result["kube_pods_subnet"] = cn.Pods.CIDRBlocks[0]
 	}
 	return result
 }
@@ -263,30 +265,6 @@ func mergeSectionMaps(base, overrides map[string]interface{}) map[string]interfa
 		result[k] = v
 	}
 	return result
-}
-
-func (r *AnsibleConfigReconciler) fetchObjectForRef(ctx context.Context, ref *corev1.ObjectReference, defaultNamespace string) (*unstructured.Unstructured, error) {
-	if ref == nil || ref.APIVersion == "" || ref.Kind == "" || ref.Name == "" {
-		return nil, nil
-	}
-	gv, err := schema.ParseGroupVersion(ref.APIVersion)
-	if err != nil {
-		return nil, err
-	}
-	gvk := gv.WithKind(ref.Kind)
-	mapping, err := r.RESTMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
-	if err != nil {
-		return nil, err
-	}
-	resource := r.DynamicClient.Resource(mapping.Resource)
-	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-		ns := ref.Namespace
-		if ns == "" {
-			ns = defaultNamespace
-		}
-		return resource.Namespace(ns).Get(ctx, ref.Name, metav1.GetOptions{})
-	}
-	return resource.Get(ctx, ref.Name, metav1.GetOptions{})
 }
 
 func assignString(target map[string]interface{}, obj map[string]interface{}, key string, path ...string) {
@@ -335,35 +313,6 @@ func applySliceMappings(target map[string]interface{}, obj map[string]interface{
 	}
 }
 
-func (r *AnsibleConfigReconciler) assignOpenStackSecret(ctx context.Context, scope *Scope, infraObj *unstructured.Unstructured, dest map[string]interface{}) error {
-	if infraObj == nil || r.SecretCachingClient == nil {
-		return nil
-	}
-	refMap, found, _ := unstructured.NestedMap(infraObj.Object, "spec", "credentials", "openStack", "secretRef")
-	if !found {
-		return nil
-	}
-	name, _ := refMap["name"].(string)
-	if name == "" {
-		return nil
-	}
-	ns, _ := refMap["namespace"].(string)
-	if ns == "" {
-		ns = scope.Cluster.Namespace
-	}
-	key := "password"
-	if k, ok := refMap["key"].(string); ok && k != "" {
-		key = k
-	}
-	secret := &corev1.Secret{}
-	if err := r.SecretCachingClient.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, secret); err != nil {
-		return err
-	}
-	if data, ok := secret.Data[key]; ok {
-		dest["openstack_password"] = string(data)
-	}
-	return nil
-}
 
 func normalizeConfigData(raw interface{}) map[string]interface{} {
 	switch typed := raw.(type) {
@@ -414,26 +363,13 @@ func (r *AnsibleConfigReconciler) aggregateNodeResources(ctx context.Context, sc
 	}
 	addMachine(host)
 
-	status, err := r.lookupControlPlaneStatus(ctx, scope)
+	primaryMachine, etcdMachines, err := r.findAnchorMachines(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
-	if status != nil {
-		if status.ControlPlaneInitialMachine != nil {
-			cpMachine, err := machineFromReference(ctx, r.Client, scope, status.ControlPlaneInitialMachine)
-			if err != nil {
-				return nil, err
-			}
-			addMachine(cpMachine)
-		}
-		for i := range status.EtcdInitialMachines {
-			ref := status.EtcdInitialMachines[i]
-			etcdMachine, err := machineFromReference(ctx, r.Client, scope, &ref)
-			if err != nil {
-				return nil, err
-			}
-			addMachine(etcdMachine)
-		}
+	addMachine(primaryMachine)
+	for _, machine := range etcdMachines {
+		addMachine(machine)
 	}
 
 	nodeResources := map[string]interface{}{}
@@ -453,11 +389,10 @@ func (r *AnsibleConfigReconciler) aggregateNodeResources(ctx context.Context, sc
 }
 
 func (r *AnsibleConfigReconciler) nodeResourcesFromMachine(ctx context.Context, machine *clusterv1.Machine) (map[string]interface{}, error) {
-	if machine == nil || machine.Spec.InfrastructureRef.APIVersion == "" {
+	if machine == nil || !machine.Spec.InfrastructureRef.IsDefined() {
 		return nil, nil
 	}
-	ref := machine.Spec.InfrastructureRef
-	infraMachine, err := r.fetchObjectForRef(ctx, &ref, machine.Namespace)
+	infraMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -468,4 +403,21 @@ func (r *AnsibleConfigReconciler) nodeResourcesFromMachine(ctx context.Context, 
 		return cloneMap(nodeRes), nil
 	}
 	return nil, nil
+}
+
+func (r *AnsibleConfigReconciler) machineKeepalivedInterface(ctx context.Context, machine *clusterv1.Machine) (string, error) {
+	if machine == nil || !machine.Spec.InfrastructureRef.IsDefined() {
+		return "", nil
+	}
+	infraMachine, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, machine.Spec.InfrastructureRef, machine.Namespace)
+	if err != nil {
+		return "", err
+	}
+	if infraMachine == nil {
+		return "", nil
+	}
+	if value, found, _ := unstructured.NestedString(infraMachine.Object, machineKeepalivedSpecPath...); found && value != "" {
+		return value, nil
+	}
+	return "", nil
 }

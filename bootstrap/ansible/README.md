@@ -377,34 +377,33 @@ AnsibleConfig
 2. **基础设施 Provider 调谐类**
 其中映射到Provider的字段没有确定 但代表了关联资源的类型
 
-   | 参数/字段                                 | 数据来源（示例路径，实际由 Provider 定义）                                                               | 说明                                                                                            |
-   |---------------------------------------|------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------|
-   | `kube_network_plugin`                 | `InfraCluster.Status.Network.Plugin`                                                     | 控制面声明的 CNI（如 `cilium,flannel`），由基础设施层决定后写回状态。                                                 |
-   | `cilium_openstack_project_id`         | `InfraCluster.Status.Network.OpenStack.ProjectID`                                        | Cilium VPC-CNI 所在 OpenStack 项目。                                                               |
-   | `cilium_openstack_default_subnet_id`  | `InfraCluster.Status.Network.OpenStack.Subnets["cilium-default"]`                        | 供 Pod IPPool 使用的默认子网。                                                                         |
-   | `cilium_openstack_security_group_ids` | `InfraCluster.Status.Network.OpenStack.SecurityGroups`                                   | Pod/节点网络安全组列表，需由底座统一分配。                                                                       |
-   | `vpc_cni_webhook_enable`              | `InfraCluster.Spec.Network.Features.VPCNIWebhook`                                        | 是否允许 Provider 启用/关闭 Captain 的 VPC-CNI webhook。                                                |
-   | `master_virtual_vip`                  | `InfraCluster.Status.LoadBalancer.ControlPlane.VIP`                                      | 控制平面 Keepalived 的虚拟 IP，由 Provider 在申请vip后返回。                                                  |
-   | `ingress_virtual_vip`                 | `InfraMachine.Status.LoadBalancer.Ingress.VIP  or  InfraCluster.Status.LoadBalancer.Ingress.VIP` | Ingress keepalived 的虚拟 IP，由 Provider 在申请vip后返回,控制面ingress 通常与 `harbor_addr` 一致,其他ingress 则无关系 |
-   | `keepalived_interface`                | `InfraMachine.Status.Network.Interface.Default`                                          | 宿主机默认网卡名称（如 `eth0`），和操作系统相关。                                                                  |
-   | `harbor_addr`                         | `InfraCluster.Status.LoadBalancer.Ingress.VIP`                                           | Harbor/Registry 对外暴露的 VIP 或地址，通常与 Ingress 绑定。                                                 |
-   | `cloud_master_vip`                    | `InfraCluster.Status.Platform.ControlPlaneVIP`                                           | IaaS 平台暴露的公网/业务 VIP，方便上层管理集群访问。 实际来源为clusterconfig config中的public_vip                         |
-   | `openstack_auth_domain`               | `InfraCluster.Status.Platform.OpenStack.KeystoneEndpoint`                                | Keystone/认证服务地址。                                                                              |
-   | `openstack_cinder_domain`             | `InfraCluster.Status.Platform.OpenStack.CinderEndpoint`                                  | Cinder 服务地址。                                                                                  |
-   | `openstack_nova_domain`               | `InfraCluster.Status.Platform.OpenStack.NovaEndpoint`                                    | Nova 计算服务地址。                                                                                  |
-   | `openstack_neutron_domain`            | `InfraCluster.Status.Platform.OpenStack.NeutronEndpoint`                                 | Neutron 网络服务地址。                                                                               |
-   | `openstack_user_name`                 | `InfraCluster.Spec.Credentials.OpenStack.Username`                                       | Provider 创建/继承的 OpenStack 用户名。                                                                |
-   | `openstack_password`                  | `InfraCluster.Spec.Credentials.OpenStack.SecretRef`                                      | 存放密码的 Secret 引用，bootstrap 渲染时解密注入。                                                            |
-   | `openstack_project_name`              | `InfraCluster.Status.Platform.OpenStack.Project`                                         | 集群所属项目名。                                                                                      |
-   | `openstack_project_domain_name`       | `InfraCluster.Status.Platform.OpenStack.ProjectDomain`                                   | OpenStack 项目域。                                                                                |
-   | `openstack_user_app_cred_name`        | `InfraCluster.Status.Platform.OpenStack.ApplicationCredentialName`                       | 由 Provider 为该集群生成的 App Credential 名称。                                                         |
-   | `openstack_region_name`               | `InfraCluster.Status.Platform.OpenStack.Region`                                          | 集群所在 Region。                                                                                  |
-   | `ntp_server`                          | `InfraCluster.Status.Network.TimeServer`                                                 | 底座统一发布的 NTP 地址，一般与跳板主机一致。                                                                  |
-   | `vip_mgmt`                            | `InfraCluster.Status.LoadBalancer.Management.VIP`                                        | 管理/跳板网络的虚拟 IP。                                                                                |
-   | `flannel_interface`                   | `InfraCluster.Status.Network.Interface.Flannel`                                          | Flannel/VPC-CNI 对应的宿主机网卡名称（如 `eth0`），由底座网络决定。                                                |
-   | `node_resources.<machine name>`       | `InfraMachine.Spec.resources.memory.reserved`                                            | 宿主机预留给系统层面的资源   |
+| README 字段 | Infra Type | 建议 Extensions 路径                                         | 数据来源/写入方                                               | 消费方及用途                           |
+|-------------|------------|----------------------------------------------------------|--------------------------------------------------------|----------------------------------|
+| `kube_network_plugin` | Cluster | `spec.extensions.networking.kubeNetworkPlugin`           | 用户/ClusterClass                                        | BA 渲染 vars，决定使用 cilium/flannel 等 |
+| `cilium_openstack_project_id` | Cluster | `status.extensions.networking.cilium.projectID`          | CAPO：根据网络/项目配置写入                                       | BA/ACP 配置 Cilium 与 OpenStack 集成  |
+| `cilium_openstack_default_subnet_id` | Cluster | `status.extensions.networking.cilium.defaultSubnetID`    | CAPO                                                   | BA 提供给 VPC CNI                   |
+| `cilium_openstack_security_group_ids` | Cluster | `status.extensions.networking.cilium.securityGroupIDs[]` | CAPO                                                   | BA 配置 Pod/节点安全组                  |
+| `vpc_cni_webhook_enable` | Cluster | `status.extensions.networking.cilium.webhookEnable`      | CAPO 根据网络特性写入                                          | BA 控制是否部署相关 webhook              |
+| `master_virtual_vip` | Cluster | `status.extensions.loadBalancers.controlPlane.vip`       | CAPO（API Server LB/VIP）                                | BA Inventory/vars                |
+| `ingress_virtual_vip` | Cluster | `status.extensions.loadBalancers.ingress.vip`            | CAPO（Ingress LB）                                       | BA/Harbor                        |
+| `keepalived_interface` | Machine | `spec.extensions.networkInterfaces.keepalived`           | 用户/ClusterClass 通过 Machine 模板指定                         | BA 设置 keepalived                 |
+| `harbor_addr` | Cluster | `status.extensions.loadBalancers.ingress.vip`            | CAPO/用户                                                | BA 渲染 控制面harbor入口ingress vip     |
+| `cloud_master_vip` | Cluster | `status.extensions.openStack.mgmt`                       | CAPO（管理网络 公网IP）                                        | BA/外部访问                          |
+| `openstack_auth_domain` | Cluster | `status.extensions.openStack.keystone`                   | CAPO（从 IdentityRef 解出只读 endpoint）                      | BA vars；凭证仍通过 SecretRef          |
+| `openstack_cinder_domain` | Cluster | `status.extensions.openStack.cinder`                     | CAPO                                                   | BA/存储插件                          |
+| `openstack_nova_domain` | Cluster | `status.extensions.openStack.nova`                       | CAPO                                                   | BA/Cloud provider 配置             |
+| `openstack_neutron_domain` | Cluster | `status.extensions.openStack.neutron`                    | CAPO                                                   | BA/网络插件                          |
+| `openstack_project_name` | Cluster | `status.extensions.openStack.project`                    | CAPO                                                   | BA vars                          |
+| `openstack_project_domain_name` | Cluster | `status.extensions.openStack.projectDomain`              | CAPO                                                   | BA vars                          |
+| `openstack_region_name` | Cluster | `status.extensions.openStack.region`                     | CAPO                                                   | BA vars                          |
+| `ntp_server` | Cluster | `status.extensions.platform.ntp.server`                  | CAPO（基础设施/跳板配置） 和bastion一致                             | BA hosts/vars                    |
+| `vip_mgmt` | Cluster | `status.extensions.platform.management.vip`              | CAPO（跳板机）                                              | BA/运维脚本                          |
+| `flannel_interface` | Cluster | `spec.extensions.networkInterfaces.flannel`              | 用户/ClusterClass（集群唯一配置）                             | BA vars                          |
+| `node_resources.<machine>` | Machine | `status.extensions.nodeResources.reserved`               | CAPO（根据 flavor/策略）  代表此批配置预留                           | BA 生成 `node_resources` 字段        |
 
 
+   - OpenStack 凭据通过 cloud-init/模板注入，不在 vars renderer 清单中。
+   - 控制面节点会根据 infra cluster 的 `status.extensions.openStack.appCredential.ref` 读取 Secret（沿用 CAPO 的 `clouds.yaml`），并在 cloud-init 写入 `/opt/auth-opts` 与 `/opt/cloud_config`。
    - 实现：由 infra provider 在其 CR Status、Secret 或 ConfigMap 中暴露真实值，bootstrap controller 渲染 vars 时读取 merge，确保扩容/滚动时自动继承；敏感字段（如密码）仅以 Secret 引用形式传递。
 
 3. **业务配置类（一次定义，多处复用）**

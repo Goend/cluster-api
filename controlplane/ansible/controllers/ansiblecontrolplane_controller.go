@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,10 +19,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
+	"sigs.k8s.io/cluster-api/internal/ansiblecontract"
+	"sigs.k8s.io/cluster-api/internal/contract"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -65,12 +68,12 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 	defer func() {
 		patchErr := patchHelper.Patch(ctx, acp,
 			patch.WithStatusObservedGeneration{},
-			patch.WithOwnedConditions{Conditions: []clusterv1.ConditionType{
-				clusterv1.ReadyCondition,
-				controlplanev1alpha1.CertificatesAvailableCondition,
-				controlplanev1alpha1.KubeconfigAvailableCondition,
-				controlplanev1alpha1.MachinesCreatedCondition,
-				controlplanev1alpha1.PostBootstrapReadyCondition,
+			patch.WithOwnedConditions{Conditions: []string{
+				string(clusterv1.ReadyCondition),
+				string(controlplanev1alpha1.CertificatesAvailableCondition),
+				string(controlplanev1alpha1.KubeconfigAvailableCondition),
+				string(controlplanev1alpha1.MachinesCreatedCondition),
+				string(controlplanev1alpha1.PostBootstrapReadyCondition),
 			}},
 		)
 		if patchErr != nil {
@@ -97,11 +100,11 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, nil
 	}
 
-	if !cluster.Status.InfrastructureReady {
+	if !conditions.IsTrue(cluster, string(clusterv1.ClusterInfrastructureReadyCondition)) {
 		msg := "Cluster infrastructure is not ready yet"
-		conditions.MarkFalse(acp, controlplanev1alpha1.CertificatesAvailableCondition, controlplanev1alpha1.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, msg)
-		conditions.MarkFalse(acp, controlplanev1alpha1.KubeconfigAvailableCondition, controlplanev1alpha1.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, msg)
-		conditions.MarkFalse(acp, clusterv1.ReadyCondition, controlplanev1alpha1.WaitingForClusterInfrastructureReason, clusterv1.ConditionSeverityInfo, msg)
+		setACPCondition(acp, controlplanev1alpha1.CertificatesAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
+		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
+		setACPCondition(acp, clusterv1.ReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
 		return ctrl.Result{}, nil
 	}
 
@@ -111,8 +114,8 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 
 	if !cluster.Spec.ControlPlaneEndpoint.IsValid() {
 		msg := "Cluster does not yet have a ControlPlaneEndpoint defined"
-		conditions.MarkFalse(acp, controlplanev1alpha1.KubeconfigAvailableCondition, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, msg)
-		conditions.MarkFalse(acp, controlplanev1alpha1.PostBootstrapReadyCondition, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, clusterv1.ConditionSeverityInfo, msg)
+		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
+		setACPCondition(acp, controlplanev1alpha1.PostBootstrapReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
 		return ctrl.Result{}, nil
 	}
 
@@ -142,14 +145,18 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
+	if err := r.syncAnchorAnnotations(ctx, acp, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if acp.Status.CurrentVersion == "" {
 		acp.Status.CurrentVersion = acp.Spec.Version
 	} else if acp.Status.CurrentVersion != acp.Spec.Version {
 		msg := fmt.Sprintf("changing spec.version from %s to %s is not supported yet", acp.Status.CurrentVersion, acp.Spec.Version)
 		acp.Status.FailureReason = controlplanev1alpha1.UpgradeUnsupportedReason
 		acp.Status.FailureMessage = ptr.To(msg)
-		conditions.MarkFalse(acp, clusterv1.ReadyCondition, controlplanev1alpha1.UpgradeUnsupportedReason, clusterv1.ConditionSeverityError, msg)
-		logger.Error(fmt.Errorf(msg), "spec.version changes are not yet implemented")
+		setACPCondition(acp, clusterv1.ReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.UpgradeUnsupportedReason, msg)
+		logger.Error(fmt.Errorf("%s", msg), "spec.version changes are not yet implemented")
 		return ctrl.Result{}, nil
 	} else {
 		acp.Status.FailureReason = ""
@@ -160,15 +167,17 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
-	conditions.SetSummary(acp,
-		conditions.WithConditions(
-			controlplanev1alpha1.CertificatesAvailableCondition,
-			controlplanev1alpha1.KubeconfigAvailableCondition,
-			controlplanev1alpha1.MachinesCreatedCondition,
-			clusterv1.MachinesReadyCondition,
-			controlplanev1alpha1.PostBootstrapReadyCondition,
-		),
-	)
+	if err := conditions.SetSummaryCondition(acp, acp, string(clusterv1.ReadyCondition),
+		conditions.ForConditionTypes{
+			string(controlplanev1alpha1.CertificatesAvailableCondition),
+			string(controlplanev1alpha1.KubeconfigAvailableCondition),
+			string(controlplanev1alpha1.MachinesCreatedCondition),
+			string(clusterv1.MachinesReadyCondition),
+			string(controlplanev1alpha1.PostBootstrapReadyCondition),
+		},
+	); err != nil {
+		logger.Error(err, "failed to summarize Ready condition")
+	}
 
 	logger.V(2).Info("reconciled AnsibleControlPlane", "observedVersion", acp.Status.CurrentVersion)
 
@@ -201,11 +210,17 @@ func (r *AnsibleControlPlaneReconciler) updateReplicaStatus(ctx context.Context,
 	}
 
 	machineCollection := collections.FromMachineList(machineList)
-	conditions.SetAggregate(acp, clusterv1.MachinesReadyCondition, machineCollection.ConditionGetters(), conditions.AddSourceRef())
+	if machineCollection.Len() > 0 {
+		if err := conditions.SetAggregateCondition(machineCollection.UnsortedList(), acp, string(clusterv1.MachinesReadyCondition)); err != nil {
+			return err
+		}
+	} else {
+		conditions.Delete(acp, string(clusterv1.MachinesReadyCondition))
+	}
 
 	var readyCount int32
 	for i := range machineList.Items {
-		if conditions.IsTrue(&machineList.Items[i], clusterv1.ReadyCondition) {
+		if conditions.IsTrue(&machineList.Items[i], string(clusterv1.ReadyCondition)) {
 			readyCount++
 		}
 	}
@@ -228,7 +243,7 @@ func (r *AnsibleControlPlaneReconciler) updateReplicaStatus(ctx context.Context,
 	}
 
 	acp.Status.Initialized = acp.Status.ControlPlaneInitialMachine != nil
-	acp.Status.Ready = conditions.IsTrue(acp, clusterv1.ReadyCondition)
+	acp.Status.Ready = conditions.IsTrue(acp, string(clusterv1.ReadyCondition))
 	return nil
 }
 
@@ -243,10 +258,10 @@ func (r *AnsibleControlPlaneReconciler) reconcileClusterCertificates(ctx context
 	controllerRef := metav1.NewControllerRef(acp, controlplanev1alpha1.GroupVersion.WithKind(ansibleControlPlaneKind))
 	certificates := clustersecret.NewCertificatesForInitialControlPlane(nil)
 	if err := certificates.LookupOrGenerate(ctx, r.Client, util.ObjectKey(cluster), *controllerRef); err != nil {
-		conditions.MarkFalse(acp, controlplanev1alpha1.CertificatesAvailableCondition, controlplanev1alpha1.CertificatesGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		setACPCondition(acp, controlplanev1alpha1.CertificatesAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.CertificatesGenerationFailedReason, err.Error())
 		return err
 	}
-	conditions.MarkTrue(acp, controlplanev1alpha1.CertificatesAvailableCondition)
+	setACPCondition(acp, controlplanev1alpha1.CertificatesAvailableCondition, metav1.ConditionTrue, "", "")
 	return nil
 }
 
@@ -258,21 +273,21 @@ func (r *AnsibleControlPlaneReconciler) reconcileKubeconfig(ctx context.Context,
 	existing := &corev1.Secret{}
 	if err := r.Client.Get(ctx, secretKey, existing); err != nil {
 		if !apierrors.IsNotFound(err) {
-			conditions.MarkFalse(acp, controlplanev1alpha1.KubeconfigAvailableCondition, controlplanev1alpha1.KubeconfigGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.KubeconfigGenerationFailedReason, err.Error())
 			return err
 		}
 		owner := metav1.NewControllerRef(cluster, clusterv1.GroupVersion.WithKind("Cluster"))
 		if err := clusterkubeconfig.CreateSecretWithOwner(ctx, r.Client, util.ObjectKey(cluster), cluster.Spec.ControlPlaneEndpoint.String(), *owner); err != nil {
-			conditions.MarkFalse(acp, controlplanev1alpha1.KubeconfigAvailableCondition, controlplanev1alpha1.KubeconfigGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.KubeconfigGenerationFailedReason, err.Error())
 			return err
 		}
 	} else {
 		if err := r.ensureKubeconfigMetadata(ctx, cluster, existing); err != nil {
-			conditions.MarkFalse(acp, controlplanev1alpha1.KubeconfigAvailableCondition, controlplanev1alpha1.KubeconfigGenerationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+			setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.KubeconfigGenerationFailedReason, err.Error())
 			return err
 		}
 	}
-	conditions.MarkTrue(acp, controlplanev1alpha1.KubeconfigAvailableCondition)
+	setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionTrue, "", "")
 	return nil
 }
 
@@ -308,7 +323,7 @@ func (r *AnsibleControlPlaneReconciler) syncMachines(ctx context.Context, acp *c
 	}
 	isEtcdRequired := desiredEtcdReplicas(acp) > 0
 	if controlPlaneDesired <= 0 && !isEtcdRequired {
-		conditions.MarkTrue(acp, controlplanev1alpha1.MachinesCreatedCondition)
+		setACPCondition(acp, controlplanev1alpha1.MachinesCreatedCondition, metav1.ConditionTrue, "", "")
 		return nil
 	}
 
@@ -332,13 +347,13 @@ func (r *AnsibleControlPlaneReconciler) syncMachines(ctx context.Context, acp *c
 				}
 			}
 			msg := "waiting for the first control plane Machine to finish initialization before creating additional replicas"
-			conditions.MarkFalse(acp, controlplanev1alpha1.MachinesCreatedCondition, controlplanev1alpha1.WaitingForPrimaryMachineReason, clusterv1.ConditionSeverityInfo, msg)
+			setACPCondition(acp, controlplanev1alpha1.MachinesCreatedCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForPrimaryMachineReason, msg)
 			return nil
 		}
 	}
 
 	if current >= controlPlaneDesired {
-		conditions.MarkTrue(acp, controlplanev1alpha1.MachinesCreatedCondition)
+		setACPCondition(acp, controlplanev1alpha1.MachinesCreatedCondition, metav1.ConditionTrue, "", "")
 		return r.ensureStandaloneEtcdMachines(ctx, acp, cluster)
 	}
 
@@ -348,13 +363,13 @@ func (r *AnsibleControlPlaneReconciler) syncMachines(ctx context.Context, acp *c
 			if reason == "" {
 				reason = controlplanev1alpha1.MachineCreationFailedReason
 			}
-			conditions.MarkFalse(acp, controlplanev1alpha1.MachinesCreatedCondition, reason, clusterv1.ConditionSeverityError, err.Error())
+			setACPCondition(acp, controlplanev1alpha1.MachinesCreatedCondition, metav1.ConditionFalse, reason, err.Error())
 			return err
 		}
 		current++
 	}
 
-	conditions.MarkTrue(acp, controlplanev1alpha1.MachinesCreatedCondition)
+	setACPCondition(acp, controlplanev1alpha1.MachinesCreatedCondition, metav1.ConditionTrue, "", "")
 	return r.ensureStandaloneEtcdMachines(ctx, acp, cluster)
 }
 
@@ -468,13 +483,20 @@ func (r *AnsibleControlPlaneReconciler) ensureStandaloneEtcdMachines(ctx context
 	return nil
 }
 
-func (r *AnsibleControlPlaneReconciler) cloneInfrastructureMachine(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, name string, labels, annotations map[string]string) (*corev1.ObjectReference, error) {
-	templateRef := acp.Spec.MachineTemplate.Spec.InfrastructureRef.DeepCopy()
-	if templateRef.Namespace == "" {
-		templateRef.Namespace = acp.Namespace
+func (r *AnsibleControlPlaneReconciler) cloneInfrastructureMachine(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, name string, labels, annotations map[string]string) (clusterv1.ContractVersionedObjectReference, error) {
+	templateContractRef := acp.Spec.MachineTemplate.Spec.InfrastructureRef
+	apiVersion, err := contract.GetAPIVersion(ctx, r.Client, templateContractRef.GroupKind())
+	if err != nil {
+		return clusterv1.ContractVersionedObjectReference{}, err
+	}
+	templateRef := &corev1.ObjectReference{
+		APIVersion: apiVersion,
+		Kind:       templateContractRef.Kind,
+		Namespace:  acp.Namespace,
+		Name:       templateContractRef.Name,
 	}
 	owner := metav1.NewControllerRef(acp, controlplanev1alpha1.GroupVersion.WithKind(ansibleControlPlaneKind))
-	return external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
+	_, ref, err := external.CreateFromTemplate(ctx, &external.CreateFromTemplateInput{
 		Client:      r.Client,
 		TemplateRef: templateRef,
 		Namespace:   acp.Namespace,
@@ -484,9 +506,13 @@ func (r *AnsibleControlPlaneReconciler) cloneInfrastructureMachine(ctx context.C
 		Labels:      labels,
 		Annotations: annotations,
 	})
+	if err != nil {
+		return clusterv1.ContractVersionedObjectReference{}, err
+	}
+	return ref, nil
 }
 
-func (r *AnsibleControlPlaneReconciler) createBootstrapConfig(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, machineName string, labels, annotations map[string]string, roleOverride []string) (*corev1.ObjectReference, error) {
+func (r *AnsibleControlPlaneReconciler) createBootstrapConfig(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, machineName string, labels, annotations map[string]string, roleOverride []string) (clusterv1.ContractVersionedObjectReference, error) {
 	specCopy := acp.Spec.AnsibleConfigSpec.DeepCopy()
 	if len(roleOverride) > 0 {
 		specCopy.Role = make([]string, len(roleOverride))
@@ -519,24 +545,22 @@ func (r *AnsibleControlPlaneReconciler) createBootstrapConfig(ctx context.Contex
 	cfg.Labels[clusterv1.ClusterNameLabel] = cluster.Name
 
 	if err := r.Client.Create(ctx, cfg); err != nil {
-		return nil, err
+		return clusterv1.ContractVersionedObjectReference{}, err
 	}
 
-	return &corev1.ObjectReference{
-		APIVersion: bootstrapv1.GroupVersion.String(),
-		Kind:       "AnsibleConfig",
-		Name:       cfg.Name,
-		Namespace:  cfg.Namespace,
-		UID:        cfg.UID,
+	return clusterv1.ContractVersionedObjectReference{
+		APIGroup: bootstrapv1.GroupVersion.Group,
+		Kind:     "AnsibleConfig",
+		Name:     cfg.Name,
 	}, nil
 }
 
-func (r *AnsibleControlPlaneReconciler) adoptBootstrapConfig(ctx context.Context, ref *corev1.ObjectReference, machine *clusterv1.Machine) error {
-	if ref == nil || ref.Namespace == "" {
+func (r *AnsibleControlPlaneReconciler) adoptBootstrapConfig(ctx context.Context, ref clusterv1.ContractVersionedObjectReference, machine *clusterv1.Machine) error {
+	if !ref.IsDefined() {
 		return nil
 	}
 	cfg := &bootstrapv1.AnsibleConfig{}
-	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, cfg); err != nil {
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: machine.Namespace, Name: ref.Name}, cfg); err != nil {
 		return err
 	}
 	owner := metav1.OwnerReference{
@@ -608,4 +632,80 @@ func (r *AnsibleControlPlaneReconciler) releaseInitLease(ctx context.Context, ac
 		return err
 	}
 	return r.Client.Delete(ctx, lease)
+}
+
+func setACPCondition(acp *controlplanev1alpha1.AnsibleControlPlane, conditionType clusterv1.ConditionType, status metav1.ConditionStatus, reason, message string) {
+	conditions.Set(acp, metav1.Condition{
+		Type:    string(conditionType),
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
+}
+
+func (r *AnsibleControlPlaneReconciler) syncAnchorAnnotations(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
+	machineList := &clusterv1.MachineList{}
+	selectors := []client.ListOption{
+		client.InNamespace(acp.Namespace),
+		client.MatchingLabels{
+			clusterv1.ClusterNameLabel: cluster.Name,
+		},
+	}
+	if err := r.Client.List(ctx, machineList, selectors...); err != nil {
+		return err
+	}
+
+	primaryName := ""
+	if acp.Status.ControlPlaneInitialMachine != nil {
+		primaryName = acp.Status.ControlPlaneInitialMachine.Name
+	}
+	etcdNames := sets.New[string]()
+	for i := range acp.Status.EtcdInitialMachines {
+		if name := acp.Status.EtcdInitialMachines[i].Name; name != "" {
+			etcdNames.Insert(name)
+		}
+	}
+
+	for i := range machineList.Items {
+		machine := &machineList.Items[i]
+		wantPrimary := primaryName != "" && machine.Name == primaryName
+		if err := r.ensureMachineAnnotation(ctx, machine, ansiblecontract.ControlPlaneInitialMachineAnnotation, wantPrimary); err != nil {
+			return err
+		}
+		wantEtcd := etcdNames.Has(machine.Name)
+		if err := r.ensureMachineAnnotation(ctx, machine, ansiblecontract.EtcdInitialMachineAnnotation, wantEtcd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *AnsibleControlPlaneReconciler) ensureMachineAnnotation(ctx context.Context, machine *clusterv1.Machine, key string, enabled bool) error {
+	annotations := machine.GetAnnotations()
+	if enabled {
+		if annotations != nil && annotations[key] == ansiblecontract.AnnotationTrueValue() {
+			return nil
+		}
+		original := machine.DeepCopy()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[key] = ansiblecontract.AnnotationTrueValue()
+		machine.SetAnnotations(annotations)
+		return r.Client.Patch(ctx, machine, client.MergeFrom(original))
+	}
+	if annotations == nil {
+		return nil
+	}
+	if _, ok := annotations[key]; !ok {
+		return nil
+	}
+	original := machine.DeepCopy()
+	delete(annotations, key)
+	if len(annotations) == 0 {
+		machine.SetAnnotations(nil)
+	} else {
+		machine.SetAnnotations(annotations)
+	}
+	return r.Client.Patch(ctx, machine, client.MergeFrom(original))
 }

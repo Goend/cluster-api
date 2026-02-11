@@ -13,7 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
 )
 
@@ -49,11 +49,12 @@ func (r *AnsibleControlPlaneReconciler) ensureBootstrapAnchors(ctx context.Conte
 		if err != nil {
 			continue
 		}
+		_, isControl := machine.Labels[clusterv1.MachineControlPlaneLabel]
 		cand := candidate{
 			machine:   machine,
 			created:   machine.CreationTimestamp,
 			hasEtcd:   hasRole(roles, "etcd"),
-			isControl: machine.Labels[clusterv1.MachineControlPlaneLabel] != "",
+			isControl: isControl,
 		}
 		if cand.isControl {
 			cpCandidates = append(cpCandidates, cand)

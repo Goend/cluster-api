@@ -1,0 +1,146 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controllers
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	ansiblecloudinit "sigs.k8s.io/cluster-api/bootstrap/ansible/internal/cloudinit"
+	"sigs.k8s.io/cluster-api/controllers/external"
+	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/yaml"
+)
+
+type openStackCloudsFile struct {
+	Clouds map[string]openStackCloudEntry `yaml:"clouds"`
+}
+
+type openStackCloudEntry struct {
+	Auth       openStackCloudAuth `yaml:"auth"`
+	RegionName string             `yaml:"region_name"`
+}
+
+type openStackCloudAuth struct {
+	AuthURL             string `yaml:"auth_url"`
+	AppCredentialID     string `yaml:"application_credential_id"`
+	AppCredentialSecret string `yaml:"application_credential_secret"`
+}
+
+func (r *AnsibleConfigReconciler) buildOpenStackAppCredentialFiles(ctx context.Context, scope *Scope) ([]ansiblecloudinit.File, error) {
+	if scope == nil || scope.Cluster == nil {
+		return nil, nil
+	}
+	machine, err := machineFromScope(scope)
+	if err != nil {
+		return nil, err
+	}
+	if machine == nil || !util.IsControlPlaneMachine(machine) {
+		return nil, nil
+	}
+	if !scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+		return nil, nil
+	}
+	infraObj, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	if infraObj == nil {
+		return nil, nil
+	}
+	ref, found, err := unstructured.NestedString(infraObj.UnstructuredContent(), "status", "extensions", "openStack", "appCredential", "ref")
+	if err != nil {
+		return nil, err
+	}
+	if !found || ref == "" {
+		return nil, nil
+	}
+	secretClient := r.SecretCachingClient
+	if secretClient == nil {
+		secretClient = r.Client
+	}
+	secret := &corev1.Secret{}
+	namespace := infraObj.GetNamespace()
+	if namespace == "" {
+		namespace = scope.Cluster.Namespace
+	}
+	if err := secretClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref}, secret); err != nil {
+		return nil, err
+	}
+	cloudsData, ok := secret.Data["clouds.yaml"]
+	if !ok {
+		return nil, errors.Errorf("app credential secret %s/%s missing clouds.yaml", namespace, ref)
+	}
+	cloudName := fmt.Sprintf("%s-%s", scope.Cluster.Namespace, scope.Cluster.Name)
+	entry, err := parseOpenStackCloudEntry(cloudsData, cloudName, scope.Cluster.Name)
+	if err != nil {
+		return nil, err
+	}
+	if entry.Auth.AuthURL == "" || entry.Auth.AppCredentialID == "" || entry.Auth.AppCredentialSecret == "" || entry.RegionName == "" {
+		return nil, errors.New("app credential secret is missing required auth fields")
+	}
+	authOpts := fmt.Sprintf("auth-url=%s\napplication-credential-id=%s\napplication-credential-secret=%s\nregion=%s\n", entry.Auth.AuthURL, entry.Auth.AppCredentialID, entry.Auth.AppCredentialSecret, entry.RegionName)
+	cloudConfig := fmt.Sprintf("[Global]\nauth-url=%s\napplication-credential-id=%s\napplication-credential-secret=%s\nregion=%s\n[BlockStorage]\nbs-version=v2\nignore-volume-az=True\n", entry.Auth.AuthURL, entry.Auth.AppCredentialID, entry.Auth.AppCredentialSecret, entry.RegionName)
+	files := []ansiblecloudinit.File{
+		{
+			Path:        "/opt/auth-opts",
+			Owner:       defaultBootstrapFileOwner,
+			Permissions: "0600",
+			Content:     authOpts,
+		},
+		{
+			Path:        "/opt/cloud_config",
+			Owner:       defaultBootstrapFileOwner,
+			Permissions: "0600",
+			Content:     cloudConfig,
+		},
+	}
+	return files, nil
+}
+
+func parseOpenStackCloudEntry(data []byte, primaryName string, fallbackName string) (openStackCloudEntry, error) {
+	var clouds openStackCloudsFile
+	if err := yaml.Unmarshal(data, &clouds); err != nil {
+		return openStackCloudEntry{}, errors.Wrap(err, "failed to parse clouds.yaml")
+	}
+	if len(clouds.Clouds) == 0 {
+		return openStackCloudEntry{}, errors.New("clouds.yaml contains no clouds entries")
+	}
+	if primaryName != "" {
+		if entry, ok := clouds.Clouds[primaryName]; ok {
+			return entry, nil
+		}
+	}
+	if fallbackName != "" {
+		if entry, ok := clouds.Clouds[fallbackName]; ok {
+			return entry, nil
+		}
+	}
+	if len(clouds.Clouds) == 1 {
+		for _, entry := range clouds.Clouds {
+			return entry, nil
+		}
+	}
+	if primaryName != "" {
+		return openStackCloudEntry{}, errors.Errorf("clouds.yaml missing cloud %s", primaryName)
+	}
+	return openStackCloudEntry{}, errors.New("clouds.yaml missing expected cloud entry")
+}

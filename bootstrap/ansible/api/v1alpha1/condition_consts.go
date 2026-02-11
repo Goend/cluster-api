@@ -16,7 +16,7 @@ limitations under the License.
 
 package v1alpha1
 
-import clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+import clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 
 // Conditions and condition Reasons for the AnsibleConfig object.
 
@@ -27,6 +27,9 @@ const (
 	// same reconciliation, so the user will always see a transition from Wait to Generated without having
 	// evidence that BootstrapSecret generation is started/in progress.
 	DataSecretAvailableCondition clusterv1.ConditionType = "DataSecretAvailable"
+
+	// DataSecretGeneratedReason indicates a bootstrap data secret has been successfully created.
+	DataSecretGeneratedReason = "DataSecretGenerated"
 
 	// WaitingForClusterInfrastructureReason (Severity=Info) document a bootstrap secret generation process
 	// waiting for the cluster infrastructure to be ready.

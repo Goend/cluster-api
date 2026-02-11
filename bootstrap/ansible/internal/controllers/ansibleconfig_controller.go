@@ -19,8 +19,8 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -36,21 +36,19 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	ansiblecloudinit "sigs.k8s.io/cluster-api/bootstrap/ansible/internal/cloudinit"
 	"sigs.k8s.io/cluster-api/bootstrap/ansible/internal/locking"
 	bsutil "sigs.k8s.io/cluster-api/bootstrap/util"
-	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
-	expv1 "sigs.k8s.io/cluster-api/exp/api/v1beta1"
 	"sigs.k8s.io/cluster-api/feature"
+	capicontrollerutil "sigs.k8s.io/cluster-api/internal/util/controller"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/annotations"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/predicates"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -66,6 +64,8 @@ const (
 
 	bootstrapCompleteCommand = "echo \"Ansible pre-bootstrap completed\""
 )
+
+var ansibleConfigGroupKind = bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind()
 
 // InitLocker coordinates the first control plane initialization.
 type InitLocker interface {
@@ -127,17 +127,18 @@ func (r *AnsibleConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 	if r.RESTMapper == nil {
 		r.RESTMapper = mgr.GetRESTMapper()
 	}
-	b := ctrl.NewControllerManagedBy(mgr).
+	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "ansibleconfig")
+	b := capicontrollerutil.NewControllerManagedBy(mgr, predicateLog).
 		For(&bootstrapv1.AnsibleConfig{}).
 		WithOptions(options).
 		Watches(
 			&clusterv1.Machine{},
 			handler.EnqueueRequestsFromMapFunc(r.MachineToBootstrapMapFunc),
-		).WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue))
+		).WithEventFilter(predicates.ResourceNotPausedAndHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue))
 
 	if feature.Gates.Enabled(feature.MachinePool) {
 		b = b.Watches(
-			&expv1.MachinePool{},
+			&clusterv1.MachinePool{},
 			handler.EnqueueRequestsFromMapFunc(r.MachinePoolToBootstrapMapFunc),
 		)
 	}
@@ -145,22 +146,8 @@ func (r *AnsibleConfigReconciler) SetupWithManager(ctx context.Context, mgr ctrl
 	b = b.Watches(
 		&clusterv1.Cluster{},
 		handler.EnqueueRequestsFromMapFunc(r.ClusterToAnsibleConfigs),
-		builder.WithPredicates(
-			predicates.All(ctrl.LoggerFrom(ctx),
-				predicates.ClusterUnpausedAndInfrastructureReady(ctrl.LoggerFrom(ctx)),
-				predicates.ResourceHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue),
-			),
-		),
-	)
-
-	b = b.Watches(
-		&controlplanev1alpha1.AnsibleControlPlane{},
-		handler.EnqueueRequestsFromMapFunc(r.ControlPlaneToAnsibleConfigs),
-		builder.WithPredicates(
-			predicates.All(ctrl.LoggerFrom(ctx),
-				predicates.ResourceNotPausedAndHasFilterLabel(ctrl.LoggerFrom(ctx), r.WatchFilterValue),
-			),
-		),
+		predicates.ClusterPausedTransitionsOrInfrastructureProvisioned(mgr.GetScheme(), predicateLog),
+		predicates.ResourceHasFilterLabel(mgr.GetScheme(), predicateLog, r.WatchFilterValue),
 	)
 
 	if err := b.Complete(r); err != nil {
@@ -266,14 +253,19 @@ func (r *AnsibleConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Attempt to Patch the AnsibleConfig object and status after each reconciliation if no error occurs.
 	defer func() {
-		// always update the readyCondition; the summary is represented using the "1 of x completed" notation.
-		conditions.SetSummary(config,
-			conditions.WithConditions(
-				bootstrapv1.DataSecretAvailableCondition,
-			),
-		)
-		// Patch ObservedGeneration only if the reconciliation completed successfully
-		patchOpts := []patch.Option{}
+		if err := conditions.SetSummaryCondition(config, config, string(clusterv1.ReadyCondition),
+			conditions.ForConditionTypes{
+				string(bootstrapv1.DataSecretAvailableCondition),
+			},
+		); err != nil {
+			rerr = kerrors.NewAggregate([]error{rerr, err})
+		}
+		patchOpts := []patch.Option{
+			patch.WithOwnedConditions{Conditions: []string{
+				string(clusterv1.ReadyCondition),
+				string(bootstrapv1.DataSecretAvailableCondition),
+			}},
+		}
 		if rerr == nil {
 			patchOpts = append(patchOpts, patch.WithStatusObservedGeneration{})
 		}
@@ -304,14 +296,14 @@ func (r *AnsibleConfigReconciler) reconcile(ctx context.Context, scope *Scope, c
 		config.Status.Ready = true
 		config.Status.DataSecretName = configOwner.DataSecretName()
 		markInitializationDataSecretCreated(config)
-		conditions.MarkTrue(config, bootstrapv1.DataSecretAvailableCondition)
+		setDataSecretCondition(config, metav1.ConditionTrue, bootstrapv1.DataSecretGeneratedReason, "")
 		return ctrl.Result{}, nil
 	}
 
 	if !config.Status.Ready {
 		if err := r.reconcilePreBootstrap(ctx, scope); err != nil {
 			log.Error(err, "Failed to generate bootstrap data")
-			conditions.MarkFalse(config, bootstrapv1.DataSecretAvailableCondition, bootstrapv1.DataSecretGenerationFailedReason, clusterv1.ConditionSeverityError, err.Error())
+			setDataSecretCondition(config, metav1.ConditionFalse, bootstrapv1.DataSecretGenerationFailedReason, err.Error())
 			return ctrl.Result{}, err
 		}
 	}
@@ -365,7 +357,7 @@ func (r *AnsibleConfigReconciler) storeBootstrapData(ctx context.Context, scope 
 	scope.Config.Status.DataSecretName = ptr.To(secret.Name)
 	scope.Config.Status.Ready = true
 	markInitializationDataSecretCreated(scope.Config)
-	conditions.MarkTrue(scope.Config, bootstrapv1.DataSecretAvailableCondition)
+	setDataSecretCondition(scope.Config, metav1.ConditionTrue, bootstrapv1.DataSecretGeneratedReason, "")
 	return nil
 }
 
@@ -391,6 +383,18 @@ func (r *AnsibleConfigReconciler) renderBootstrapData(ctx context.Context, scope
 		return nil, errors.Errorf("certificate secret %s/%s is missing tls.key", secretName.Namespace, secretName.Name)
 	}
 	files := buildBootstrapFiles(ca, key, scope.Config.Spec.Files)
+	appCredFiles, err := r.buildOpenStackAppCredentialFiles(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, appCredFiles...)
+	sshAuthFile, err := r.buildSSHAuthorizedKeyFile(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	if sshAuthFile != nil {
+		files = append(files, *sshAuthFile)
+	}
 	userData := &ansiblecloudinit.BaseUserData{
 		WriteFiles:  files,
 		RunCommands: []string{bootstrapCompleteCommand},
@@ -431,7 +435,7 @@ func (r *AnsibleConfigReconciler) reconcilePostBootstrap(ctx context.Context, sc
 		return ctrl.Result{}, nil
 	}
 
-	if !scope.ConfigOwner.IsInfrastructureReady() {
+	if !scope.ConfigOwner.IsInfrastructureProvisioned() {
 		scope.Logger.Info("Waiting for machine infrastructure to report ready before launching Ansible operations")
 		return ctrl.Result{}, nil
 	}
@@ -663,61 +667,26 @@ func (r *AnsibleConfigReconciler) ClusterToAnsibleConfigs(ctx context.Context, o
 	}
 
 	for _, m := range machineList.Items {
-		if m.Spec.Bootstrap.ConfigRef != nil &&
-			m.Spec.Bootstrap.ConfigRef.GroupVersionKind().GroupKind() == bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind() {
+		if isAnsibleBootstrapConfigRef(m.Spec.Bootstrap.ConfigRef) {
 			name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}
 			result = append(result, ctrl.Request{NamespacedName: name})
 		}
 	}
 
 	if feature.Gates.Enabled(feature.MachinePool) {
-		machinePoolList := &expv1.MachinePoolList{}
+		machinePoolList := &clusterv1.MachinePoolList{}
 		if err := r.Client.List(ctx, machinePoolList, selectors...); err != nil {
 			return nil
 		}
 
 		for _, mp := range machinePoolList.Items {
-			if mp.Spec.Template.Spec.Bootstrap.ConfigRef != nil &&
-				mp.Spec.Template.Spec.Bootstrap.ConfigRef.GroupVersionKind().GroupKind() == bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind() {
+			if isAnsibleBootstrapConfigRef(mp.Spec.Template.Spec.Bootstrap.ConfigRef) {
 				name := client.ObjectKey{Namespace: mp.Namespace, Name: mp.Spec.Template.Spec.Bootstrap.ConfigRef.Name}
 				result = append(result, ctrl.Request{NamespacedName: name})
 			}
 		}
 	}
 
-	return result
-}
-
-// ControlPlaneToAnsibleConfigs enqueues AnsibleConfigs whenever the owning ACP status changes.
-func (r *AnsibleConfigReconciler) ControlPlaneToAnsibleConfigs(ctx context.Context, o client.Object) []ctrl.Request {
-	acp, ok := o.(*controlplanev1alpha1.AnsibleControlPlane)
-	if !ok {
-		return nil
-	}
-	clusterName := acp.Labels[clusterv1.ClusterNameLabel]
-	if clusterName == "" {
-		return nil
-	}
-	machineList := &clusterv1.MachineList{}
-	selectors := []client.ListOption{
-		client.InNamespace(acp.Namespace),
-		client.MatchingLabels{
-			clusterv1.ClusterNameLabel:         clusterName,
-			clusterv1.MachineControlPlaneLabel: "",
-		},
-	}
-	if err := r.Client.List(ctx, machineList, selectors...); err != nil {
-		return nil
-	}
-	result := []ctrl.Request{}
-	for i := range machineList.Items {
-		m := machineList.Items[i]
-		if m.Spec.Bootstrap.ConfigRef != nil &&
-			m.Spec.Bootstrap.ConfigRef.GroupVersionKind().GroupKind() == bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind() {
-			name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}
-			result = append(result, ctrl.Request{NamespacedName: name})
-		}
-	}
 	return result
 }
 
@@ -757,13 +726,11 @@ func (r *AnsibleConfigReconciler) ensureKubeanClusterDependencies(ctx context.Co
 	}
 	if len(tasks) > 0 {
 		ready, err := r.ensureConfigMapsWithLock(ctx, scope, tasks)
-		if err != nil || !ready {
-			return ready, err
-		}
-	}
-	if ref := parseNamespacedSecretRef(specMap, "sshAuthRef", defaultNamespace); ref.Name != "" {
-		ready, err := r.ensureSSHAuthSecret(ctx, scope, ref)
 		if err != nil {
+			if stderrors.Is(err, errAnchorMachinesUnavailable) {
+				scope.Logger.Info("waiting for control plane anchors to be annotated before generating inventory")
+				return false, nil
+			}
 			return false, err
 		}
 		if !ready {
@@ -832,22 +799,12 @@ type configMapReference struct {
 	Namespace string
 }
 
-type lockReference struct {
-	Namespace string
-	Name      string
-}
-
 type configMapTask struct {
 	reference configMapReference
 	builder   configMapDataBuilder
 }
 
 type configMapDataBuilder func() (map[string]string, error)
-
-type secretReference struct {
-	Name      string
-	Namespace string
-}
 
 func decodeTemplateSpec(raw runtime.RawExtension) (map[string]interface{}, error) {
 	if len(raw.Raw) == 0 {
@@ -932,86 +889,6 @@ func parseNamespacedSecretRef(spec map[string]interface{}, field, defaultNamespa
 	return secretReference{Name: name, Namespace: namespace}
 }
 
-func (r *AnsibleConfigReconciler) ensureSSHAuthSecret(ctx context.Context, scope *Scope, ref secretReference) (bool, error) {
-	ns := ref.Namespace
-	if ns == "" {
-		ns = scope.Config.Namespace
-	}
-	lockRef := configMapReference{Name: ref.Name, Namespace: ns}
-	acquired, err := r.withLeaseLock(ctx, scope, lockRef, true, func() error {
-		key := types.NamespacedName{Namespace: ns, Name: ref.Name}
-		secret := &corev1.Secret{}
-		if err := r.Client.Get(ctx, key, secret); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return errors.Wrapf(err, "failed to get Secret %s/%s", ns, ref.Name)
-			}
-			newSecret := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      ref.Name,
-					Namespace: ns,
-					Labels: map[string]string{
-						clusterv1.ClusterNameLabel: scope.Cluster.Name,
-					},
-				},
-				Type: corev1.SecretTypeOpaque,
-			}
-			if ns == scope.Config.Namespace {
-				newSecret.SetOwnerReferences(util.EnsureOwnerRef(nil, metav1.OwnerReference{
-					APIVersion: bootstrapv1.GroupVersion.String(),
-					Kind:       "AnsibleConfig",
-					Name:       scope.Config.Name,
-					UID:        scope.Config.UID,
-					Controller: ptr.To(true),
-				}))
-			}
-			if err := r.Client.Create(ctx, newSecret); err != nil {
-				if apierrors.IsAlreadyExists(err) {
-					return nil
-				}
-				return errors.Wrapf(err, "failed to create Secret %s/%s", ns, ref.Name)
-			}
-			return nil
-		}
-
-		updated := false
-		if secret.Labels == nil {
-			secret.Labels = map[string]string{}
-		}
-		if secret.Labels[clusterv1.ClusterNameLabel] != scope.Cluster.Name {
-			secret.Labels[clusterv1.ClusterNameLabel] = scope.Cluster.Name
-			updated = true
-		}
-		if ns == scope.Config.Namespace {
-			ownerRef := metav1.OwnerReference{
-				APIVersion: bootstrapv1.GroupVersion.String(),
-				Kind:       "AnsibleConfig",
-				Name:       scope.Config.Name,
-				UID:        scope.Config.UID,
-				Controller: ptr.To(true),
-			}
-			ownerRefs := util.EnsureOwnerRef(secret.GetOwnerReferences(), ownerRef)
-			if !reflect.DeepEqual(ownerRefs, secret.GetOwnerReferences()) {
-				secret.SetOwnerReferences(ownerRefs)
-				updated = true
-			}
-		}
-		if !updated {
-			return nil
-		}
-		if err := r.Client.Update(ctx, secret); err != nil {
-			return errors.Wrapf(err, "failed to update Secret %s/%s", ns, ref.Name)
-		}
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	if !acquired {
-		return false, nil
-	}
-	return true, nil
-}
-
 func markInitializationDataSecretCreated(config *bootstrapv1.AnsibleConfig) {
 	if config.Status.Initialization == nil {
 		config.Status.Initialization = &bootstrapv1.BootstrapDataInitializationStatus{}
@@ -1028,7 +905,7 @@ func (r *AnsibleConfigReconciler) MachineToBootstrapMapFunc(_ context.Context, o
 	}
 
 	result := []ctrl.Request{}
-	if m.Spec.Bootstrap.ConfigRef != nil && m.Spec.Bootstrap.ConfigRef.GroupVersionKind() == bootstrapv1.GroupVersion.WithKind("AnsibleConfig") {
+	if isAnsibleBootstrapConfigRef(m.Spec.Bootstrap.ConfigRef) {
 		name := client.ObjectKey{Namespace: m.Namespace, Name: m.Spec.Bootstrap.ConfigRef.Name}
 		result = append(result, ctrl.Request{NamespacedName: name})
 	}
@@ -1038,16 +915,32 @@ func (r *AnsibleConfigReconciler) MachineToBootstrapMapFunc(_ context.Context, o
 // MachinePoolToBootstrapMapFunc is a handler.ToRequestsFunc to be used to enqueue
 // request for reconciliation of AnsibleConfig.
 func (r *AnsibleConfigReconciler) MachinePoolToBootstrapMapFunc(_ context.Context, o client.Object) []ctrl.Request {
-	m, ok := o.(*expv1.MachinePool)
+	m, ok := o.(*clusterv1.MachinePool)
 	if !ok {
 		panic(fmt.Sprintf("Expected a MachinePool but got a %T", o))
 	}
 
 	result := []ctrl.Request{}
 	configRef := m.Spec.Template.Spec.Bootstrap.ConfigRef
-	if configRef != nil && configRef.GroupVersionKind().GroupKind() == bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind() {
+	if isAnsibleBootstrapConfigRef(configRef) {
 		name := client.ObjectKey{Namespace: m.Namespace, Name: configRef.Name}
 		result = append(result, ctrl.Request{NamespacedName: name})
 	}
 	return result
+}
+
+func isAnsibleBootstrapConfigRef(ref clusterv1.ContractVersionedObjectReference) bool {
+	if !ref.IsDefined() {
+		return false
+	}
+	return ref.GroupKind() == ansibleConfigGroupKind
+}
+
+func setDataSecretCondition(config *bootstrapv1.AnsibleConfig, status metav1.ConditionStatus, reason, message string) {
+	conditions.Set(config, metav1.Condition{
+		Type:    string(bootstrapv1.DataSecretAvailableCondition),
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
 }

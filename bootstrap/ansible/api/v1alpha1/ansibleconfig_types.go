@@ -20,8 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 )
 
 // AnsibleConfigSpec defines the desired state of AnsibleConfig.
@@ -217,7 +215,9 @@ type AnsibleConfigStatus struct {
 
 	// Conditions defines current service state of the AnsibleConfig.
 	// +optional
-	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // BootstrapDataInitializationStatus reports bootstrap readiness for contract consumers.
@@ -244,12 +244,12 @@ type AnsibleConfig struct {
 }
 
 // GetConditions returns the set of conditions for this object.
-func (c *AnsibleConfig) GetConditions() clusterv1.Conditions {
+func (c *AnsibleConfig) GetConditions() []metav1.Condition {
 	return c.Status.Conditions
 }
 
 // SetConditions sets the conditions on this object.
-func (c *AnsibleConfig) SetConditions(conditions clusterv1.Conditions) {
+func (c *AnsibleConfig) SetConditions(conditions []metav1.Condition) {
 	c.Status.Conditions = conditions
 }
 

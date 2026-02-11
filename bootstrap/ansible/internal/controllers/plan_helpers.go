@@ -5,7 +5,7 @@ import (
 	"errors"
 	"strconv"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,7 +31,7 @@ func (r *AnsibleConfigReconciler) determineClusterOperationPlan(ctx context.Cont
 		return plan, nil, nil
 	}
 
-	clusterInitialized := conditions.IsTrue(scope.Cluster, clusterv1.ControlPlaneInitializedCondition)
+	clusterInitialized := conditions.IsTrue(scope.Cluster, clusterv1.ClusterControlPlaneInitializedCondition)
 	if !clusterInitialized {
 		if masterRole {
 			requeue, err := r.ensureInitLockHolder(ctx, scope)

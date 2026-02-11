@@ -10,6 +10,7 @@ import (
 	"strings"
 	"text/template"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -33,7 +34,6 @@ type Renderer struct {
 	sources   []GroupResource
 	values    map[string]interface{}
 	execCtx   context.Context
-	cache     map[string]map[string]interface{}
 }
 
 // NewRenderer creates a renderer. When sources is empty, defaults to Config CRD.
@@ -51,7 +51,6 @@ func NewRenderer(dyn dynamic.Interface, mapper meta.RESTMapper, namespace string
 		namespace: namespace,
 		sources:   sources,
 		values:    map[string]interface{}{},
-		cache:     map[string]map[string]interface{}{},
 	}
 }
 
@@ -62,6 +61,9 @@ func (r *Renderer) Load(ctx context.Context) error {
 		gvr := schema.GroupVersionResource{Group: src.Group, Version: src.Version, Resource: src.Resource}
 		list, err := r.listObjects(ctx, gvr, r.namespace)
 		if err != nil {
+			if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+				continue
+			}
 			return err
 		}
 		for _, item := range list.Items {
@@ -97,7 +99,6 @@ func (r *Renderer) Render(ctx context.Context, tpl string) (string, error) {
 		ctx = context.Background()
 	}
 	r.execCtx = ctx
-	r.cache = map[string]map[string]interface{}{}
 	defer func() {
 		r.execCtx = nil
 	}()
@@ -459,14 +460,6 @@ func (r *Renderer) fetchResource(args []interface{}) (interface{}, error) {
 	if len(args) > 4 {
 		namespace = fmt.Sprint(args[4])
 	}
-	mode := "list"
-	if hasName {
-		mode = "get"
-	}
-	key := fmt.Sprintf("%s|%s|%s|%s|%s|%s", mode, group, version, resource, namespace, name)
-	if val, ok := r.cache[key]; ok {
-		return val, nil
-	}
 	gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
 	ctx := r.currentCtx()
 	if hasName {
@@ -474,16 +467,13 @@ func (r *Renderer) fetchResource(args []interface{}) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		r.cache[key] = obj.Object
 		return obj.Object, nil
 	}
 	list, err := r.listObjects(ctx, gvr, namespace)
 	if err != nil {
 		return nil, err
 	}
-	content := list.UnstructuredContent()
-	r.cache[key] = content
-	return content, nil
+	return list.UnstructuredContent(), nil
 }
 
 func (r *Renderer) currentCtx() context.Context {

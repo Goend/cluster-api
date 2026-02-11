@@ -4,7 +4,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 )
 
@@ -98,7 +98,10 @@ type AnsibleControlPlaneStatus struct {
 
 	// Conditions represents the observations of ACP's state.
 	// +optional
-	Conditions clusterv1.Conditions `json:"conditions,omitempty"`
+	// +listType=map
+	// +listMapKey=type
+	// +kubebuilder:validation:MaxItems=32
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -124,12 +127,12 @@ type AnsibleControlPlane struct {
 }
 
 // GetConditions returns the ACP status conditions.
-func (acp *AnsibleControlPlane) GetConditions() clusterv1.Conditions {
+func (acp *AnsibleControlPlane) GetConditions() []metav1.Condition {
 	return acp.Status.Conditions
 }
 
 // SetConditions sets the ACP status conditions.
-func (acp *AnsibleControlPlane) SetConditions(conditions clusterv1.Conditions) {
+func (acp *AnsibleControlPlane) SetConditions(conditions []metav1.Condition) {
 	acp.Status.Conditions = conditions
 }
 

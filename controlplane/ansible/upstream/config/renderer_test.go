@@ -2,13 +2,33 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/fake"
+	"k8s.io/client-go/restmapper"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+const (
+	rendererLiveNamespace  = "ems"
+	rendererLiveConfigName = "clusterconfig"
+)
+
+var (
+	serviceCatalogConfigsGVR = schema.GroupVersionResource{
+		Group:    "servicecatalog.ecp.com",
+		Version:  "v1",
+		Resource: "configs",
+	}
 )
 
 func TestRendererResourceFunction(t *testing.T) {
@@ -238,6 +258,82 @@ func TestRendererSetValueAndTemplateFuncs(t *testing.T) {
 	if out != expected {
 		t.Fatalf("unexpected output: %s", out)
 	}
+}
+
+func TestRendererReadsClusterConfigPublicVIPFromLiveCluster(t *testing.T) {
+	ctx := context.Background()
+	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		clientcmd.NewDefaultClientConfigLoadingRules(),
+		&clientcmd.ConfigOverrides{},
+	).ClientConfig()
+	if err != nil {
+		t.Skipf("skipping live cluster renderer test, failed to load default kubeconfig: %v", err)
+	}
+
+	dyn, err := dynamic.NewForConfig(restCfg)
+	if err != nil {
+		t.Fatalf("failed to construct dynamic client: %v", err)
+	}
+
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restCfg)
+	if err != nil {
+		t.Fatalf("failed to create discovery client: %v", err)
+	}
+	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(discoveryClient))
+
+	cfg, err := dyn.Resource(serviceCatalogConfigsGVR).Namespace(rendererLiveNamespace).Get(ctx, rendererLiveConfigName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get Config/%s from %s: %v", rendererLiveConfigName, rendererLiveNamespace, err)
+	}
+
+	publicVIP, path := locatePublicVIP(cfg)
+	if publicVIP == "" {
+		t.Skip("clusterconfig.cluster_attrs.public_vip not populated; skipping live renderer assertion")
+	}
+
+	renderer := NewRenderer(dyn, restMapper, rendererLiveNamespace, nil)
+	if err := renderer.Load(ctx); err != nil {
+		t.Fatalf("renderer load failed: %v", err)
+	}
+
+	expr := buildResourceExpression(path)
+	template := fmt.Sprintf("{{ eval \"%s\" }}", expr)
+	out, err := renderer.Render(ctx, template)
+	if err != nil {
+		t.Fatalf("render failed: %v", err)
+	}
+	if out != publicVIP {
+		t.Fatalf("unexpected public vip, want %s, got %s", publicVIP, out)
+	}
+}
+
+func locatePublicVIP(obj *unstructured.Unstructured) (string, []string) {
+	candidates := [][]string{
+		{"spec", "cluster_attrs", "public_vip"},
+		{"data", "cluster_attrs", "public_vip"},
+		{"spec", "clusterAttrs", "publicVip"},
+		{"data", "clusterAttrs", "publicVip"},
+	}
+	for _, path := range candidates {
+		if value, found, _ := unstructured.NestedString(obj.Object, path...); found && value != "" {
+			return value, path
+		}
+	}
+	return "", nil
+}
+
+func buildResourceExpression(path []string) string {
+	expr := fmt.Sprintf(
+		"resource('%s','%s','%s','%s')",
+		serviceCatalogConfigsGVR.Group,
+		serviceCatalogConfigsGVR.Version,
+		serviceCatalogConfigsGVR.Resource,
+		rendererLiveConfigName,
+	)
+	for _, segment := range path {
+		expr += fmt.Sprintf("['%s']", segment)
+	}
+	return expr
 }
 
 func newConfigObject(name string, data map[string]interface{}) runtime.Object {

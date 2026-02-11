@@ -2,7 +2,6 @@
 title: Ansible Based Control Plane Management
 authors:
   - "@jian"
-  - "@codex-bot"
 reviewers:
   - "@cluster-api-maintainers"
   - "@kubean-io"

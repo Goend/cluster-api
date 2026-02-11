@@ -221,10 +221,14 @@ CONTROLLER_IMG ?= $(REGISTRY)/$(IMAGE_NAME)
 # bootstrap
 KUBEADM_BOOTSTRAP_IMAGE_NAME ?= kubeadm-bootstrap-controller
 KUBEADM_BOOTSTRAP_CONTROLLER_IMG ?= $(REGISTRY)/$(KUBEADM_BOOTSTRAP_IMAGE_NAME)
+ANSIBLE_BOOTSTRAP_IMAGE_NAME ?= bootstrap-ansible
+ANSIBLE_BOOTSTRAP_CONTROLLER_IMG ?= $(REGISTRY)/$(ANSIBLE_BOOTSTRAP_IMAGE_NAME)
 
 # control plane
 KUBEADM_CONTROL_PLANE_IMAGE_NAME ?= kubeadm-control-plane-controller
 KUBEADM_CONTROL_PLANE_CONTROLLER_IMG ?= $(REGISTRY)/$(KUBEADM_CONTROL_PLANE_IMAGE_NAME)
+ANSIBLE_CONTROL_PLANE_IMAGE_NAME ?= controlplane-ansible
+ANSIBLE_CONTROL_PLANE_CONTROLLER_IMG ?= $(REGISTRY)/$(ANSIBLE_CONTROL_PLANE_IMAGE_NAME)
 
 # capd
 CAPD_IMAGE_NAME ?= capd-manager
@@ -861,12 +865,31 @@ docker-build-kubeadm-bootstrap: ## Build the docker image for kubeadm bootstrap 
 	$(MAKE) set-manifest-image MANIFEST_IMG=$(KUBEADM_BOOTSTRAP_CONTROLLER_IMG)-$(ARCH) MANIFEST_TAG=$(TAG) TARGET_RESOURCE="./bootstrap/kubeadm/config/default/manager_image_patch.yaml"
 	$(MAKE) set-manifest-pull-policy TARGET_RESOURCE="./bootstrap/kubeadm/config/default/manager_pull_policy.yaml"
 
+.PHONY: docker-build-ansible-bootstrap
+docker-build-ansible-bootstrap: ## Build the docker image for ansible bootstrap controller manager
+## reads Dockerfile from stdin to avoid an incorrectly cached Dockerfile (https://github.com/moby/buildkit/issues/1368)
+	cat ./Dockerfile | DOCKER_BUILDKIT=1 docker build --build-arg builder_image=$(GO_CONTAINER_IMAGE) --build-arg goproxy=$(GOPROXY) --build-arg ARCH=$(ARCH) --build-arg package=./bootstrap/ansible --build-arg ldflags="$(LDFLAGS)" . -t $(ANSIBLE_BOOTSTRAP_CONTROLLER_IMG)-$(ARCH):$(TAG) --file -
+	docker tag $(ANSIBLE_BOOTSTRAP_CONTROLLER_IMG)-$(ARCH):$(TAG) $(ANSIBLE_BOOTSTRAP_CONTROLLER_IMG):$(TAG)
+
 .PHONY: docker-build-kubeadm-control-plane
 docker-build-kubeadm-control-plane: ## Build the docker image for kubeadm control plane controller manager
 ## reads Dockerfile from stdin to avoid an incorrectly cached Dockerfile (https://github.com/moby/buildkit/issues/1368)
 	cat ./Dockerfile | DOCKER_BUILDKIT=1 docker build --build-arg builder_image=$(GO_CONTAINER_IMAGE) --build-arg goproxy=$(GOPROXY) --build-arg ARCH=$(ARCH) --build-arg package=./controlplane/kubeadm --build-arg ldflags="$(LDFLAGS)" . -t $(KUBEADM_CONTROL_PLANE_CONTROLLER_IMG)-$(ARCH):$(TAG) --file -
 	$(MAKE) set-manifest-image MANIFEST_IMG=$(KUBEADM_CONTROL_PLANE_CONTROLLER_IMG)-$(ARCH) MANIFEST_TAG=$(TAG) TARGET_RESOURCE="./controlplane/kubeadm/config/default/manager_image_patch.yaml"
 	$(MAKE) set-manifest-pull-policy TARGET_RESOURCE="./controlplane/kubeadm/config/default/manager_pull_policy.yaml"
+
+.PHONY: docker-build-ansible-control-plane
+docker-build-ansible-control-plane: ## Build the docker image for ansible control plane controller manager
+## reads Dockerfile from stdin to avoid an incorrectly cached Dockerfile (https://github.com/moby/buildkit/issues/1368)
+	cat ./Dockerfile | DOCKER_BUILDKIT=1 docker build --build-arg builder_image=$(GO_CONTAINER_IMAGE) --build-arg goproxy=$(GOPROXY) --build-arg ARCH=$(ARCH) --build-arg package=./controlplane/ansible --build-arg ldflags="$(LDFLAGS)" . -t $(ANSIBLE_CONTROL_PLANE_CONTROLLER_IMG)-$(ARCH):$(TAG) --file -
+	docker tag $(ANSIBLE_CONTROL_PLANE_CONTROLLER_IMG)-$(ARCH):$(TAG) $(ANSIBLE_CONTROL_PLANE_CONTROLLER_IMG):$(TAG)
+
+.PHONY: docker-build-ansible
+docker-build-ansible: docker-build-ansible-bootstrap docker-build-ansible-control-plane ## Build the docker images for ansible bootstrap and control plane
+
+.PHONY: docker-build-ansible-local
+docker-build-ansible-local: ## Build ansible images tagged for hub.easystack.cn/test with a minute timestamp
+	$(MAKE) REGISTRY=hub.easystack.cn/test TAG=$$(date +%Y%m%d%H%M) docker-build-ansible
 
 .PHONY: docker-build-docker-infrastructure
 docker-build-docker-infrastructure: ## Build the docker image for docker infrastructure controller manager

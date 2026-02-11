@@ -3,20 +3,20 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 )
 
 type ansibleConfigCache map[client.ObjectKey]*bootstrapv1.AnsibleConfig
+
+var ansibleConfigGroupKind = bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind()
 
 func (r *AnsibleControlPlaneReconciler) listControlPlaneMachines(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) (*clusterv1.MachineList, error) {
 	selectorLabels := labels.Set{
@@ -71,7 +71,7 @@ func (r *AnsibleControlPlaneReconciler) primaryMachineProgress(ctx context.Conte
 	if cfg != nil {
 		postBootstrap = cfg.Status.PostBootstrapCompleted
 	}
-	nodeReady := machine.Status.NodeRef != nil && conditions.IsTrue(machine, clusterv1.ReadyCondition)
+	nodeReady := machine.Status.NodeRef.IsDefined() && conditions.IsTrue(machine, string(clusterv1.ReadyCondition))
 	return postBootstrap, nodeReady, nil
 }
 
@@ -80,14 +80,10 @@ func (r *AnsibleControlPlaneReconciler) ansibleConfigForMachine(ctx context.Cont
 		return nil, nil
 	}
 	ref := machine.Spec.Bootstrap.ConfigRef
-	if ref == nil || ref.Kind != "AnsibleConfig" || !strings.HasPrefix(ref.APIVersion, bootstrapv1.GroupVersion.Group) {
+	if !ref.IsDefined() || ref.GroupKind() != ansibleConfigGroupKind {
 		return nil, nil
 	}
-	ns := ref.Namespace
-	if ns == "" {
-		ns = machine.Namespace
-	}
-	key := client.ObjectKey{Namespace: ns, Name: ref.Name}
+	key := client.ObjectKey{Namespace: machine.Namespace, Name: ref.Name}
 	if cfg, found := cache[key]; found {
 		return cfg, nil
 	}
@@ -202,11 +198,11 @@ func initLockName(acp *controlplanev1alpha1.AnsibleControlPlane) string {
 	return fmt.Sprintf("%s-%s", acp.Name, initLockNameSuffix)
 }
 
-func buildMachineSpec(acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, infraRef *corev1.ObjectReference, bootstrapRef *corev1.ObjectReference) clusterv1.MachineSpec {
+func buildMachineSpec(acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster, infraRef clusterv1.ContractVersionedObjectReference, bootstrapRef clusterv1.ContractVersionedObjectReference) clusterv1.MachineSpec {
 	spec := acp.Spec.MachineTemplate.Spec.DeepCopy()
 	spec.ClusterName = cluster.Name
-	spec.Version = ptr.To(acp.Spec.Version)
-	spec.InfrastructureRef = *infraRef
+	spec.Version = acp.Spec.Version
+	spec.InfrastructureRef = infraRef
 	spec.Bootstrap.ConfigRef = bootstrapRef
 	spec.Bootstrap.DataSecretName = nil
 	return *spec

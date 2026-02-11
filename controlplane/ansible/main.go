@@ -10,7 +10,7 @@ import (
 	klogr "k8s.io/klog/v2/klogr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	bootstrapansiblev1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/controlplane/ansible/controllers"
