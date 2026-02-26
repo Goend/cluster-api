@@ -9,11 +9,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
-
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
-	"sigs.k8s.io/cluster-api/util"
 )
 
 func (r *AnsibleConfigReconciler) ensureConfigMapsWithLock(ctx context.Context, scope *Scope, tasks []configMapTask) (bool, error) {
@@ -60,19 +56,14 @@ func (r *AnsibleConfigReconciler) ensureConfigMapExists(ctx context.Context, sco
 				Namespace: ns,
 				Labels: map[string]string{
 					clusterv1.ClusterNameLabel: scope.Cluster.Name,
+					// 用标签追踪 AC 归属，避免与外部控制器 OwnerRef 冲突
+					"bootstrap.cluster.x-k8s.io/ac-ns":   scope.Config.Namespace,
+					"bootstrap.cluster.x-k8s.io/ac-name": scope.Config.Name,
 				},
 			},
 			Data: desiredData,
 		}
-		if ns == scope.Config.Namespace {
-			newCM.SetOwnerReferences(util.EnsureOwnerRef(nil, metav1.OwnerReference{
-				APIVersion: bootstrapv1.GroupVersion.String(),
-				Kind:       "AnsibleConfig",
-				Name:       scope.Config.Name,
-				UID:        scope.Config.UID,
-				Controller: ptr.To(true),
-			}))
-		}
+		// 不再写 AC OwnerReference，统一通过标签进行清理
 		if err := r.Client.Create(ctx, newCM); err != nil {
 			if apierrors.IsAlreadyExists(err) {
 				return nil
@@ -92,19 +83,14 @@ func (r *AnsibleConfigReconciler) ensureConfigMapExists(ctx context.Context, sco
 		cm.Labels[clusterv1.ClusterNameLabel] = scope.Cluster.Name
 		updated = true
 	}
-	if ns == scope.Config.Namespace {
-		ownerRef := metav1.OwnerReference{
-			APIVersion: bootstrapv1.GroupVersion.String(),
-			Kind:       "AnsibleConfig",
-			Name:       scope.Config.Name,
-			UID:        scope.Config.UID,
-			Controller: ptr.To(true),
-		}
-		ownerRefs := util.EnsureOwnerRef(cm.GetOwnerReferences(), ownerRef)
-		if !reflect.DeepEqual(ownerRefs, cm.GetOwnerReferences()) {
-			cm.SetOwnerReferences(ownerRefs)
-			updated = true
-		}
+	// 确保追踪标签存在
+	if cm.Labels["bootstrap.cluster.x-k8s.io/ac-ns"] != scope.Config.Namespace {
+		cm.Labels["bootstrap.cluster.x-k8s.io/ac-ns"] = scope.Config.Namespace
+		updated = true
+	}
+	if cm.Labels["bootstrap.cluster.x-k8s.io/ac-name"] != scope.Config.Name {
+		cm.Labels["bootstrap.cluster.x-k8s.io/ac-name"] = scope.Config.Name
+		updated = true
 	}
 	if !reflect.DeepEqual(cm.Data, desiredData) {
 		cm.Data = desiredData

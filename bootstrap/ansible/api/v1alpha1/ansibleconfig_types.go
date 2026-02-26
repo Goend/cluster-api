@@ -54,7 +54,7 @@ type AnsibleConfigSpec struct {
 	// +optional
 	Role []string `json:"role,omitempty"`
 
-	// VarsConfigRefs points to Config CRs that provide overrides for vars.yaml sections.
+    // VarsConfigRefs points to Config CRs that provide overrides for group_vars.yml sections.
 	// The "business" and "fixed" references must be provided by the user to supply
 	// environment-specific data, while "infra" is optional and defaults to an
 	// auto-generated Config managed by the controller when omitted.

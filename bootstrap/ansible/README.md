@@ -87,7 +87,7 @@ Ansible Bootstrap Provider 通过 `AnsibleConfig.spec.role`（类型为 `[]strin
 - `spec.role`：描述当前 Machine 所扮演的任务（如 `kube-master`、`etcd`、`ingress` 等），用于在实例自身的 cloud-init 与后续 hook 中注入最小自描述；
 - 同一个节点可在 `role` 中声明多个字符串，从而出现在多个 Ansible group 中（例如既是 `kube-master` 又是 `ingress`）。
 
-在 postBootstrap 逻辑中，控制器会根据 `role` 渲染出 Kubespray 所需的 `inventory.ini`（针对当前节点），并额外拉取集群内所有 `kube-master`、`etcd` 角色节点确保扩容时能够引用这些关键成员，输出顺序按照 Machine 创建时间排序以保证 determinism：
+在 postBootstrap 逻辑中，控制器会根据 `role` 渲染出 Kubean/Kubespray 所需的 `hosts.yml`（针对当前节点），并额外拉取集群内所有 `kube-master`、`etcd` 角色节点确保扩容时能够引用这些关键成员，输出顺序按照 Machine 创建时间排序以保证 determinism：
 
 ```
 [kube-master]
@@ -364,7 +364,7 @@ AnsibleConfig
 
 ### Vars 参数分类与管理原则
 
-在 ansible bootstrap 中，`vars.yaml` 是控制面/组件的核心配置。随着不同角色、行业诉求不断增加，推荐按照“事实归属”拆分变量，并通过统一的 merge 逻辑生成 vars，避免硬编码：
+在 ansible bootstrap 中，`group_vars.yml` 是控制面/组件的核心配置。随着不同角色、行业诉求不断增加，推荐按照“事实归属”拆分变量，并通过统一的 merge 逻辑生成 vars，避免硬编码：
 
 1. **Machine / ControlPlane 推导类（来自 CAPI 规范）**
 
@@ -478,7 +478,7 @@ AnsibleConfig
 - 使用 `mergeSpecMaps` 之类的 helper 把多来源变量叠加，优先级建议为：Machine/Infra ⇒ 业务 Config ⇒ 手工覆盖。
 - 敏感信息（如 OpenStack 密码）放在 Secret 中，bootstrap controller 仅引用 Secret。
 - inventory/vars 中的角色扩展通过 `AnsibleConfig.Spec.Role` 与集中 helper（`inventory_helpers.go`）维护，保证每个 role 仅在一个地方描述。
-- **配置入口**：`AnsibleConfig.Spec.VarsConfigRefs` 要求用户在集群 namespace 预先创建 `<cluster-name>-vars-business` 与 `<cluster-name>-vars-fixed` 两个 Config（`controlplane.cluster.x-k8s.io/v1alpha1, Kind=Config`），控制器在渲染 `vars.yaml` 时会读取它们的 `data`，缺失任意一个都会阻断 post-bootstrap 并通过事件/Condition 提示；`<cluster-name>-vars-infra` 则默认由控制器自动创建（需要覆盖时可手动编辑）用于承载基础设施推导出的事实数据。
+- **配置入口**：`AnsibleConfig.Spec.VarsConfigRefs` 要求用户在集群 namespace 预先创建 `<cluster-name>-vars-business` 与 `<cluster-name>-vars-fixed` 两个 Config（`controlplane.cluster.x-k8s.io/v1alpha1, Kind=Config`），控制器在渲染 `group_vars.yml` 时会读取它们的 `data`，缺失任意一个都会阻断 post-bootstrap 并通过事件/Condition 提示；`<cluster-name>-vars-infra` 则默认由控制器自动创建（需要覆盖时可手动编辑）用于承载基础设施推导出的事实数据。
 
 通过上述约定，可以在基于 Cluster API 的体系内保持：
 

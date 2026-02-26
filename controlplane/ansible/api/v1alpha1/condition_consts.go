@@ -43,6 +43,18 @@ const (
 	// WaitingForControlPlaneEndpointReason indicates the Cluster lacks a valid ControlPlaneEndpoint.
 	WaitingForControlPlaneEndpointReason = "WaitingForControlPlaneEndpoint"
 
-	// WaitingForPrimaryMachineReason indicates the first control plane Machine is still initializing.
-	WaitingForPrimaryMachineReason = "WaitingForPrimaryMachine"
+    // WaitingForPrimaryMachineReason indicates the first control plane Machine is still initializing.
+    WaitingForPrimaryMachineReason = "WaitingForPrimaryMachine"
+
+    // CertificatesAvailableReason indicates cluster certificates are present and valid.
+    CertificatesAvailableReason = "CertificatesAvailable"
+
+    // KubeconfigGeneratedReason indicates the admin kubeconfig has been created or updated.
+    KubeconfigGeneratedReason = "KubeconfigGenerated"
+
+    // MachinesCreatedReason indicates desired Machine objects have been created.
+    MachinesCreatedReason = "MachinesCreated"
+
+    // PostBootstrapCompletedReason indicates Ansible post-bootstrap steps completed.
+    PostBootstrapCompletedReason = "PostBootstrapCompleted"
 )

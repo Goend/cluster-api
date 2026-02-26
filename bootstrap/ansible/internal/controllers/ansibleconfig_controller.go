@@ -30,7 +30,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/dynamic"
@@ -51,6 +53,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 )
 
@@ -90,6 +93,15 @@ type AnsibleConfigReconciler struct {
 	WatchFilterValue string
 }
 
+const (
+    // Labels to track resources created for an AnsibleConfig. Split namespace/name
+    // to satisfy label value syntax (slashes are not allowed in label values).
+    acOwnerNSLabelKey   = "bootstrap.cluster.x-k8s.io/ac-ns"
+    acOwnerNameLabelKey = "bootstrap.cluster.x-k8s.io/ac-name"
+    // AnsibleConfigFinalizer ensures we have a chance to clean related resources on delete.
+    ansibleConfigFinalizer = "ansibleconfig.bootstrap.cluster.x-k8s.io"
+)
+
 // Scope is a scoped struct used during reconciliation.
 type Scope struct {
 	logr.Logger
@@ -105,7 +117,6 @@ type Scope struct {
 
 type clusterOperationPlan struct {
 	ActionType string
-	Vars       map[string]interface{}
 }
 
 func defaultClusterOperationPlan() clusterOperationPlan {
@@ -274,8 +285,21 @@ func (r *AnsibleConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}()
 
-	// Ignore deleted AnsibleConfigs.
+	// Ensure finalizer for cleanup.
+	if config.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(config, ansibleConfigFinalizer) {
+		controllerutil.AddFinalizer(config, ansibleConfigFinalizer)
+		return ctrl.Result{}, nil
+	}
+
+	// Handle delete cleanup.
 	if !config.DeletionTimestamp.IsZero() {
+		if controllerutil.ContainsFinalizer(config, ansibleConfigFinalizer) {
+			// Best-effort cleanup of external resources created for this AC.
+			if err := r.cleanupExternalResources(ctx, scope); err != nil {
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(config, ansibleConfigFinalizer)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -475,6 +499,14 @@ func (r *AnsibleConfigReconciler) applyResourceFromTemplate(ctx context.Context,
 	err = r.Client.Get(ctx, client.ObjectKey{Namespace: rendered.GetNamespace(), Name: rendered.GetName()}, current)
 	if apierrors.IsNotFound(err) {
 		scope.Logger.Info("Creating ansible dependency resource", "gvk", rendered.GroupVersionKind().String(), "name", rendered.GetName(), "namespace", rendered.GetNamespace())
+		// Apply AC tracking label instead of controller OwnerReference for external resources.
+        labels := rendered.GetLabels()
+        if labels == nil {
+            labels = map[string]string{}
+        }
+        labels[acOwnerNSLabelKey] = scope.Config.Namespace
+        labels[acOwnerNameLabelKey] = scope.Config.Name
+        rendered.SetLabels(labels)
 		return r.Client.Create(ctx, rendered)
 	}
 	if err != nil {
@@ -493,6 +525,65 @@ func (r *AnsibleConfigReconciler) applyResourceFromTemplate(ctx context.Context,
 
 	if err := r.Client.Patch(ctx, current, patch); err != nil {
 		return errors.Wrapf(err, "failed to patch %s %s/%s", rendered.GroupVersionKind().String(), rendered.GetNamespace(), rendered.GetName())
+	}
+	return nil
+}
+
+// cleanupExternalResources deletes external resources created for this AnsibleConfig
+// based on the tracking label, without relying on controller OwnerReferences.
+func (r *AnsibleConfigReconciler) cleanupExternalResources(ctx context.Context, scope *Scope) error {
+    selector := client.MatchingLabels{acOwnerNSLabelKey: scope.Config.Namespace, acOwnerNameLabelKey: scope.Config.Name}
+    // Delete kubean ClusterOperations (namespaced, group kubean.io)
+    if err := r.deleteUnstructuredList(ctx, scope.Config.Namespace, "kubean.io", "v1alpha1", "clusteroperations", selector); err != nil {
+        return err
+    }
+    // Delete kubean Clusters (cluster-scoped); ignore not-found errors when listing namespaced.
+    if err := r.deleteUnstructuredList(ctx, "", "kubean.io", "v1alpha1", "clusters", selector); err != nil {
+        return err
+    }
+	// Best-effort: delete generated ConfigMaps (hosts/vars) in the AC namespace.
+	if err := r.deleteNamespacedConfigMaps(ctx, scope); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *AnsibleConfigReconciler) deleteUnstructuredList(ctx context.Context, namespace, group, version, resource string, selector client.MatchingLabels) error {
+    gvr := schema.GroupVersionResource{Group: group, Version: version, Resource: resource}
+    ls := metav1.ListOptions{LabelSelector: labels.Set(selector).AsSelector().String()}
+    var (
+        list *unstructured.UnstructuredList
+        err  error
+    )
+    if namespace == "" {
+        list, err = r.DynamicClient.Resource(gvr).List(ctx, ls)
+    } else {
+        list, err = r.DynamicClient.Resource(gvr).Namespace(namespace).List(ctx, ls)
+    }
+    if err != nil && !apierrors.IsNotFound(err) {
+        return err
+    }
+    if list == nil {
+        return nil
+    }
+    for i := range list.Items {
+        obj := &list.Items[i]
+        if obj.GetNamespace() == "" {
+            _ = r.DynamicClient.Resource(gvr).Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+        } else {
+            _ = r.DynamicClient.Resource(gvr).Namespace(obj.GetNamespace()).Delete(ctx, obj.GetName(), metav1.DeleteOptions{})
+        }
+    }
+    return nil
+}
+
+func (r *AnsibleConfigReconciler) deleteNamespacedConfigMaps(ctx context.Context, scope *Scope) error {
+	cmList := &corev1.ConfigMapList{}
+    if err := r.Client.List(ctx, cmList, client.InNamespace(scope.Config.Namespace), client.MatchingLabels{acOwnerNSLabelKey: scope.Config.Namespace, acOwnerNameLabelKey: scope.Config.Name}); err != nil {
+        return err
+    }
+	for i := range cmList.Items {
+		_ = r.Client.Delete(ctx, &cmList.Items[i])
 	}
 	return nil
 }
@@ -533,13 +624,8 @@ func buildResourceFromTemplate(scope *Scope, template bootstrapv1.ResourceTempla
 		rendered.SetAnnotations(annotations)
 	}
 
-	rendered.SetOwnerReferences(util.EnsureOwnerRef(nil, metav1.OwnerReference{
-		APIVersion: bootstrapv1.GroupVersion.String(),
-		Kind:       "AnsibleConfig",
-		Name:       scope.Config.Name,
-		UID:        scope.Config.UID,
-		Controller: ptr.To(true),
-	}))
+	// Don't set controller OwnerRef to AnsibleConfig for external resources to avoid
+	// conflicts with their own controllers (e.g., Kubean). We rely on labels + finalizer cleanup.
 
 	if len(template.Spec.Raw) > 0 {
 		spec := map[string]interface{}{}
@@ -701,28 +787,30 @@ func (r *AnsibleConfigReconciler) ensureKubeanClusterDependencies(ctx context.Co
 	}
 	tasks := []configMapTask{}
 	if ref := parseNamespacedConfigMapRef(specMap, "hostsConfRef", defaultNamespace); ref.Name != "" {
-		tasks = append(tasks, configMapTask{
-			reference: ref,
-			builder: func() (map[string]string, error) {
-				inventory, invErr := r.buildHostsInventory(ctx, scope)
-				if invErr != nil {
-					return nil, invErr
-				}
-				return map[string]string{"inventory.ini": inventory}, nil
-			},
-		})
+            tasks = append(tasks, configMapTask{
+                reference: ref,
+                builder: func() (map[string]string, error) {
+                    inventory, invErr := r.buildHostsInventory(ctx, scope)
+                    if invErr != nil {
+                        return nil, invErr
+                    }
+                    // 仍写入键 hosts.yml，但内容为 INI 风格 inventory
+                    return map[string]string{"hosts.yml": inventory}, nil
+                },
+            })
 	}
 	if ref := parseNamespacedConfigMapRef(specMap, "varsConfRef", defaultNamespace); ref.Name != "" {
-		tasks = append(tasks, configMapTask{
-			reference: ref,
-			builder: func() (map[string]string, error) {
-				rendered, err := r.renderVarsConfig(ctx, scope)
-				if err != nil {
-					return nil, err
-				}
-				return map[string]string{"vars.yaml": rendered}, nil
-			},
-		})
+            tasks = append(tasks, configMapTask{
+                reference: ref,
+                builder: func() (map[string]string, error) {
+                    rendered, err := r.renderVarsConfig(ctx, scope)
+                    if err != nil {
+                        return nil, err
+                    }
+                    // Write vars under key expected by kubean: group_vars.yml
+                    return map[string]string{"group_vars.yml": rendered}, nil
+                },
+            })
 	}
 	if len(tasks) > 0 {
 		ready, err := r.ensureConfigMapsWithLock(ctx, scope, tasks)

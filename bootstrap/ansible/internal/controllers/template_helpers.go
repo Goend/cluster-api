@@ -101,54 +101,41 @@ func clusterOperationResourceFromTemplate(scope *Scope, template *bootstrapv1.Ku
 }
 
 func defaultKubeanClusterSpec(scope *Scope, namespace string) map[string]interface{} {
+	// kubean.io/v1alpha1 Cluster 仅接受 {name, namespace}
 	return map[string]interface{}{
-		"hostsConfRef": buildNamespacedObjectReference("ConfigMap", kubeanHostsConfigMapName(scope), namespace),
-		"varsConfRef":  buildNamespacedObjectReference("ConfigMap", kubeanVarsConfigMapName(scope), namespace),
-		"sshAuthRef":   buildNamespacedObjectReference("Secret", kubeanSSHAuthSecretName(scope), namespace),
+		"hostsConfRef": map[string]interface{}{
+			"name":      kubeanHostsConfigMapName(scope),
+			"namespace": namespace,
+		},
+		"varsConfRef": map[string]interface{}{
+			"name":      kubeanVarsConfigMapName(scope),
+			"namespace": namespace,
+		},
+		"sshAuthRef": map[string]interface{}{
+			"name":      kubeanSSHAuthSecretName(scope),
+			"namespace": namespace,
+		},
 	}
 }
 
 func defaultKubeanClusterOperationSpec(scope *Scope, namespace string, clusterTemplate bootstrapv1.ResourceTemplate) map[string]interface{} {
-	spec := map[string]interface{}{
-		"cluster": buildClusterReference(clusterTemplate),
+	// kubean.io/v1alpha1 expects string fields:
+	// - spec.cluster: Cluster name (string)
+	// - spec.actionType: Operation type (string)
+	clusterName := clusterTemplate.Name
+	if clusterName == "" {
+		clusterName = kubeanClusterObjectName(scope)
 	}
-	actionType := scope.ClusterOperationPlan.ActionType
-	if actionType == "" {
-		actionType = bootstrapv1.ClusterOperationActionCluster
-	}
-	action := map[string]interface{}{"type": actionType}
-	if len(scope.ClusterOperationPlan.Vars) > 0 {
-		action["vars"] = copyInterfaceMap(scope.ClusterOperationPlan.Vars)
-	}
-	spec["action"] = action
-	return spec
-}
 
-func buildNamespacedObjectReference(kind, name, namespace string) map[string]interface{} {
-	if name == "" {
-		return map[string]interface{}{}
+	action := scope.ClusterOperationPlan.ActionType
+	if action == "" {
+		action = bootstrapv1.ClusterOperationActionCluster
 	}
-	ref := map[string]interface{}{
-		"apiVersion": "v1",
-		"kind":       kind,
-		"name":       name,
-	}
-	if namespace != "" {
-		ref["namespace"] = namespace
-	}
-	return ref
-}
 
-func buildClusterReference(clusterTemplate bootstrapv1.ResourceTemplate) map[string]interface{} {
-	ref := map[string]interface{}{
-		"apiVersion": clusterTemplate.APIVersion,
-		"kind":       clusterTemplate.Kind,
-		"name":       clusterTemplate.Name,
+	return map[string]interface{}{
+		"cluster": clusterName,
+		"action":  action,
 	}
-	if clusterTemplate.Namespace != "" {
-		ref["namespace"] = clusterTemplate.Namespace
-	}
-	return ref
 }
 
 func kubeanClusterObjectName(scope *Scope) string {

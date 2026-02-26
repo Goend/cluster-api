@@ -16,18 +16,11 @@ func (r *AnsibleConfigReconciler) determineClusterOperationPlan(ctx context.Cont
 	annotations := scope.Config.GetAnnotations()
 	action := annotations[bootstrapv1.ClusterOperationActionAnnotation]
 	roles := scope.Config.Spec.Role
-	workerOnly := isWorkerOnlyRole(roles)
 	masterRole := hasMasterRole(roles)
 
 	if action != "" {
 		plan.ActionType = action
-		if action == bootstrapv1.ClusterOperationActionScale {
-			plan.Vars = map[string]interface{}{
-				"scale_master": parseScaleMasterAnnotation(annotations),
-			}
-		} else {
-			plan.Vars = nil
-		}
+		// kubean.io/v1alpha1 ClusterOperation 不支持 vars 字段
 		return plan, nil, nil
 	}
 
@@ -42,7 +35,7 @@ func (r *AnsibleConfigReconciler) determineClusterOperationPlan(ctx context.Cont
 				return plan, requeue, nil
 			}
 			plan.ActionType = bootstrapv1.ClusterOperationActionCluster
-			plan.Vars = nil
+			// kubean.io/v1alpha1 ClusterOperation 不支持 vars 字段
 			return plan, nil, nil
 		}
 		scope.Logger.Info("waiting for the first control plane Machine to finish initialization before executing scale action")
@@ -51,7 +44,7 @@ func (r *AnsibleConfigReconciler) determineClusterOperationPlan(ctx context.Cont
 
 	r.releaseInitLock(ctx, scope)
 	plan.ActionType = bootstrapv1.ClusterOperationActionScale
-	plan.Vars = map[string]interface{}{"scale_master": masterRole && !workerOnly}
+	// kubean.io/v1alpha1 ClusterOperation 不支持 vars 字段
 	return plan, nil, nil
 }
 

@@ -24,19 +24,15 @@ const (
 	infraSectionValueKey    = "__infra_section"
 	businessSectionValueKey = "__business_section"
 	fixedSectionValueKey    = "__fixed_section"
+	// Flattened security group id (first id) exposed at top-level.
+	securityGroupsValueKey = "__cilium_sg_ids"
 
 	defaultVarsTemplate = `
-cluster_name: {{ eval "__cluster_name" }}
-ansible_config: {{ eval "__ansible_config" }}
-machine_name: {{ eval "__machine_name" }}
-machine_control_plane:
-{{ indent 2 (toYAML (eval "__machine_section")) }}
-infrastructure_provider:
-{{ indent 2 (toYAML (eval "__infra_section")) }}
-business_config:
-{{ indent 2 (toYAML (eval "__business_section")) }}
-fixed_config:
-{{ indent 2 (toYAML (eval "__fixed_section")) }}
+  cluster_name: {{ eval "__cluster_name" }}
+  ansible_config: {{ eval "__ansible_config" }}
+  machine_name: {{ eval "__machine_name" }}
+  cilium_openstack_security_group_ids: {{ eval "__cilium_sg_ids" }}
+{{ indent 2 (toYAML (eval "__merged_section")) }}
 `
 )
 
@@ -54,10 +50,10 @@ var (
 		{"ingress_virtual_vip", []string{"status", "extensions", "loadBalancers", "ingress", "vip"}},
 		{"harbor_addr", []string{"status", "extensions", "loadBalancers", "ingress", "vip"}},
 		{"cloud_master_vip", []string{"status", "extensions", "openStack", "mgmt"}},
-		{"openstack_auth_domain", []string{"status", "extensions", "openStack", "keystone"}},
-		{"openstack_cinder_domain", []string{"status", "extensions", "openStack", "cinder"}},
-		{"openstack_nova_domain", []string{"status", "extensions", "openStack", "nova"}},
-		{"openstack_neutron_domain", []string{"status", "extensions", "openStack", "neutron"}},
+		{"openstack_auth_domain", []string{"status", "extensions", "endpoints", "keystone"}},
+		{"openstack_cinder_domain", []string{"status", "extensions", "endpoints", "cinder"}},
+		{"openstack_nova_domain", []string{"status", "extensions", "endpoints", "nova"}},
+		{"openstack_neutron_domain", []string{"status", "extensions", "endpoints", "neutron"}},
 		{"openstack_project_name", []string{"status", "extensions", "openStack", "project"}},
 		{"openstack_project_domain_name", []string{"status", "extensions", "openStack", "projectDomain"}},
 		{"openstack_region_name", []string{"status", "extensions", "openStack", "region"}},
@@ -71,9 +67,9 @@ var (
 	clusterInfraSliceFields = []fieldMapping{
 		{"cilium_openstack_security_group_ids", []string{"status", "extensions", "networking", "cilium", "securityGroupIDs"}},
 	}
-	machineInfraNodeResourcesPath      = []string{"status", "extensions", "nodeResources", "reserved"}
-	machineKeepalivedSpecPath          = []string{"spec", "extensions", "networkInterfaces", "keepalived"}
-	configGVR                          = schema.GroupVersionResource{
+	machineInfraNodeResourcesPath = []string{"status", "extensions", "nodeResources", "reserved"}
+	machineKeepalivedSpecPath     = []string{"spec", "extensions", "networkInterfaces", "keepalived"}
+	configGVR                     = schema.GroupVersionResource{
 		Group:    "controlplane.cluster.x-k8s.io",
 		Version:  "v1alpha1",
 		Resource: "configs",
@@ -105,6 +101,20 @@ func (r *AnsibleConfigReconciler) renderVarsConfig(ctx context.Context, scope *S
 	}
 	infraSection = mergeSectionMaps(infraSection, infraOverrides)
 
+	// Derive flattened security group id: take the first element of the array.
+	var sgID string
+	if v, ok := infraSection["cilium_openstack_security_group_ids"]; ok {
+		if arr, ok := v.([]interface{}); ok && len(arr) > 0 {
+			if s, ok := arr[0].(string); ok {
+				sgID = s
+			}
+		} else if ss, ok := v.([]string); ok && len(ss) > 0 {
+			sgID = ss[0]
+		}
+		// 避免在合并扁平 map 时再次输出数组形式导致重复键，移除此键。
+		delete(infraSection, "cilium_openstack_security_group_ids")
+	}
+
 	businessSection := defaultBusinessConfig(scope)
 	businessOverrides, err := r.loadConfigSection(ctx, scope, "business")
 	if err != nil {
@@ -127,6 +137,15 @@ func (r *AnsibleConfigReconciler) renderVarsConfig(ctx context.Context, scope *S
 	renderer.SetValue(infraSectionValueKey, infraSection)
 	renderer.SetValue(businessSectionValueKey, businessSection)
 	renderer.SetValue(fixedSectionValueKey, fixedSection)
+	renderer.SetValue(securityGroupsValueKey, sgID)
+
+	// Merge all section maps into a flat map for group_vars.yml top-level keys.
+	merged := map[string]interface{}{}
+	merged = mergeSectionMaps(merged, machineSection)
+	merged = mergeSectionMaps(merged, infraSection)
+	merged = mergeSectionMaps(merged, businessSection)
+	merged = mergeSectionMaps(merged, fixedSection)
+	renderer.SetValue("__merged_section", merged)
 
 	if err := renderer.Load(ctx); err != nil {
 		return "", err
@@ -312,7 +331,6 @@ func applySliceMappings(target map[string]interface{}, obj map[string]interface{
 		assignStringSlice(target, obj, mapping.key, mapping.path...)
 	}
 }
-
 
 func normalizeConfigData(raw interface{}) map[string]interface{} {
 	switch typed := raw.(type) {

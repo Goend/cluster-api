@@ -30,19 +30,21 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// 注意：本包使用 sigs.k8s.io/yaml 进行反序列化；该库会先将 YAML 转为 JSON 再用 encoding/json 反序列化，
+// 因此这里必须使用 json 标签而不是 yaml 标签，避免字段解析失败导致必填字段判空。
 type openStackCloudsFile struct {
-	Clouds map[string]openStackCloudEntry `yaml:"clouds"`
+    Clouds map[string]openStackCloudEntry `json:"clouds"`
 }
 
 type openStackCloudEntry struct {
-	Auth       openStackCloudAuth `yaml:"auth"`
-	RegionName string             `yaml:"region_name"`
+    Auth       openStackCloudAuth `json:"auth"`
+    RegionName string             `json:"region_name"`
 }
 
 type openStackCloudAuth struct {
-	AuthURL             string `yaml:"auth_url"`
-	AppCredentialID     string `yaml:"application_credential_id"`
-	AppCredentialSecret string `yaml:"application_credential_secret"`
+    AuthURL             string `json:"auth_url"`
+    AppCredentialID     string `json:"application_credential_id"`
+    AppCredentialSecret string `json:"application_credential_secret"`
 }
 
 func (r *AnsibleConfigReconciler) buildOpenStackAppCredentialFiles(ctx context.Context, scope *Scope) ([]ansiblecloudinit.File, error) {

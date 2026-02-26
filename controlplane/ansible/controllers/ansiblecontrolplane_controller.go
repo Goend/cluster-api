@@ -87,7 +87,7 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 	}
 	if cluster == nil {
 		logger.Info("waiting for owner Cluster to be set")
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	if !acp.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -105,7 +105,7 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		setACPCondition(acp, controlplanev1alpha1.CertificatesAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
 		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
 		setACPCondition(acp, clusterv1.ReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if err := r.reconcileClusterCertificates(ctx, acp, cluster); err != nil {
@@ -116,7 +116,7 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		msg := "Cluster does not yet have a ControlPlaneEndpoint defined"
 		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
 		setACPCondition(acp, controlplanev1alpha1.PostBootstrapReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
-		return ctrl.Result{}, nil
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
 	if err := r.syncMachines(ctx, acp, cluster); err != nil {
@@ -186,11 +186,11 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 
 // SetupWithManager wires the controller into the manager.
 func (r *AnsibleControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&controlplanev1alpha1.AnsibleControlPlane{}).
-		Owns(&clusterv1.Machine{}).
-		Owns(&bootstrapv1.AnsibleConfig{}).
-		Complete(r)
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&controlplanev1alpha1.AnsibleControlPlane{}).
+        Owns(&clusterv1.Machine{}).
+        Owns(&bootstrapv1.AnsibleConfig{}).
+        Complete(r)
 }
 
 func (r *AnsibleControlPlaneReconciler) updateReplicaStatus(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
@@ -635,12 +635,35 @@ func (r *AnsibleControlPlaneReconciler) releaseInitLease(ctx context.Context, ac
 }
 
 func setACPCondition(acp *controlplanev1alpha1.AnsibleControlPlane, conditionType clusterv1.ConditionType, status metav1.ConditionStatus, reason, message string) {
-	conditions.Set(acp, metav1.Condition{
-		Type:    string(conditionType),
-		Status:  status,
-		Reason:  reason,
-		Message: message,
-	})
+    // Ensure Reason is never empty to satisfy CRD validation (minLength>=1).
+    if reason == "" {
+        reason = defaultReasonFor(conditionType)
+    }
+    conditions.Set(acp, metav1.Condition{
+        Type:    string(conditionType),
+        Status:  status,
+        Reason:  reason,
+        Message: message,
+    })
+}
+
+// defaultReasonFor returns a stable, non-empty Reason for a given condition type
+// when callers don't specify one explicitly.
+func defaultReasonFor(conditionType clusterv1.ConditionType) string {
+    switch conditionType {
+    case controlplanev1alpha1.CertificatesAvailableCondition:
+        return controlplanev1alpha1.CertificatesAvailableReason
+    case controlplanev1alpha1.KubeconfigAvailableCondition:
+        return controlplanev1alpha1.KubeconfigGeneratedReason
+    case controlplanev1alpha1.MachinesCreatedCondition:
+        return controlplanev1alpha1.MachinesCreatedReason
+    case controlplanev1alpha1.PostBootstrapReadyCondition:
+        return controlplanev1alpha1.PostBootstrapCompletedReason
+    case clusterv1.ReadyCondition:
+        return "Reconciled"
+    default:
+        return "Reconciled"
+    }
 }
 
 func (r *AnsibleControlPlaneReconciler) syncAnchorAnnotations(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
