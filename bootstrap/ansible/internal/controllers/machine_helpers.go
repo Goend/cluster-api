@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"net"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -13,12 +14,30 @@ import (
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
-func selectMachineIPAddress(machine *clusterv1.Machine) (string, error) {
+// selectMachineIPAddress 根据优先级选择 Machine 的地址；
+// 当 preferCIDR 非空且可解析时，会优先返回落在该 CIDR 内的第一个地址；
+// 若未命中，则回退到原有优先级的不加过滤选择。
+func selectMachineIPAddress(machine *clusterv1.Machine, preferCIDR string) (string, error) {
 	preferred := []clusterv1.MachineAddressType{
 		clusterv1.MachineExternalIP,
 		clusterv1.MachineInternalIP,
 		clusterv1.MachineExternalDNS,
 		clusterv1.MachineInternalDNS,
+	}
+	// 尝试按 CIDR 过滤优选
+	if preferCIDR != "" {
+		if _, ipnet, err := net.ParseCIDR(preferCIDR); err == nil && ipnet != nil {
+			for _, addressType := range preferred {
+				for _, addr := range machine.Status.Addresses {
+					if addr.Type != addressType || addr.Address == "" {
+						continue
+					}
+					if ip := net.ParseIP(addr.Address); ip != nil && ipnet.Contains(ip) {
+						return addr.Address, nil
+					}
+				}
+			}
+		}
 	}
 	for _, addressType := range preferred {
 		for _, addr := range machine.Status.Addresses {

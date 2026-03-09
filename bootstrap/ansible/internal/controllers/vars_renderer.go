@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,8 +32,45 @@ const (
   cluster_name: {{ eval "__cluster_name" }}
   ansible_config: {{ eval "__ansible_config" }}
   machine_name: {{ eval "__machine_name" }}
+  ansible_user: root
+  ansible_ssh_private_key_file: /auth/ssh-privatekey
+  capi_feature_gates:
+    KubeletProviderID: true
+    LBService: true
   cilium_openstack_security_group_ids: {{ eval "__cilium_sg_ids" }}
+{{- if or (eval "__bastion_fip") (eval "__cp_host") }}
+  supplementary_addresses_in_ssl_keys:
+{{- if (eval "__bastion_fip") }}
+    - {{ eval "__bastion_fip" }}
+{{- end }}
+{{- if (eval "__cp_host") }}
+    - {{ eval "__cp_host" }}
+{{- end }}
+{{- end }}
+{{- /* OpenStack LB vars resolved from infra OpenStackCluster via template resource() */}}
+{{- $infraName := eval "__infra_name" }}
+{{- if $infraName }}
+{{- $osc := eval (printf "resource('infrastructure.cluster.x-k8s.io','v1beta1','openstackclusters','%s')" $infraName) }}
+{{- $fnet := index $osc "status" "externalNetwork" "id" }}
+{{- if $fnet }}
+  cloud_provider_openstack_lb_floating_network_id: {{ $fnet }}
+{{- end }}
+{{- $subnets := index $osc "status" "network" "subnets" }}
+{{- if $subnets }}
+{{- $first := index $subnets 0 }}
+{{- $sid := index $first "id" }}
+{{- if $sid }}
+  cloud_provider_openstack_lb_subnet_id: {{ $sid }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{ indent 2 (toYAML (eval "__merged_section")) }}
+{{- if (eval "__node_resources") }}
+  node_resources:
+{{- range $name, $res := (eval "__node_resources") }}
+    {{$name}}: {memory: {{ index $res "memory" }}}
+{{- end }}
+{{- end }}
 `
 )
 
@@ -67,9 +105,8 @@ var (
 	clusterInfraSliceFields = []fieldMapping{
 		{"cilium_openstack_security_group_ids", []string{"status", "extensions", "networking", "cilium", "securityGroupIDs"}},
 	}
-	machineInfraNodeResourcesPath = []string{"status", "extensions", "nodeResources", "reserved"}
-	machineKeepalivedSpecPath     = []string{"spec", "extensions", "networkInterfaces", "keepalived"}
-	configGVR                     = schema.GroupVersionResource{
+	machineKeepalivedSpecPath = []string{"spec", "extensions", "networkInterfaces", "keepalived"}
+	configGVR                 = schema.GroupVersionResource{
 		Group:    "controlplane.cluster.x-k8s.io",
 		Version:  "v1alpha1",
 		Resource: "configs",
@@ -138,6 +175,23 @@ func (r *AnsibleConfigReconciler) renderVarsConfig(ctx context.Context, scope *S
 	renderer.SetValue(businessSectionValueKey, businessSection)
 	renderer.SetValue(fixedSectionValueKey, fixedSection)
 	renderer.SetValue(securityGroupsValueKey, sgID)
+	// 注入补充证书地址渲染所需的变量：跳板机 FIP 与 CP 主机名。
+	if fip, err := r.bastionFIP(ctx, scope); err == nil {
+		renderer.SetValue("__bastion_fip", fip)
+	} else {
+		renderer.SetValue("__bastion_fip", "")
+	}
+	if scope.Cluster != nil {
+		renderer.SetValue("__cp_host", scope.Cluster.Spec.ControlPlaneEndpoint.Host)
+		if scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+			renderer.SetValue("__infra_name", scope.Cluster.Spec.InfrastructureRef.Name)
+		} else {
+			renderer.SetValue("__infra_name", "")
+		}
+	} else {
+		renderer.SetValue("__cp_host", "")
+		renderer.SetValue("__infra_name", "")
+	}
 
 	// Merge all section maps into a flat map for group_vars.yml top-level keys.
 	merged := map[string]interface{}{}
@@ -145,6 +199,12 @@ func (r *AnsibleConfigReconciler) renderVarsConfig(ctx context.Context, scope *S
 	merged = mergeSectionMaps(merged, infraSection)
 	merged = mergeSectionMaps(merged, businessSection)
 	merged = mergeSectionMaps(merged, fixedSection)
+	if nr, ok := merged["node_resources"]; ok {
+		renderer.SetValue("__node_resources", nr)
+		delete(merged, "node_resources")
+	} else {
+		renderer.SetValue("__node_resources", nil)
+	}
 	renderer.SetValue("__merged_section", merged)
 
 	if err := renderer.Load(ctx); err != nil {
@@ -184,6 +244,14 @@ func (r *AnsibleConfigReconciler) buildInfrastructureVars(ctx context.Context, s
 		return nil, err
 	} else if keepalived != "" {
 		result["keepalived_interface"] = keepalived
+	}
+
+	// 覆盖/赋值 vip_mgmt：将集群的 ControlPlaneEndpoint.Host 直接传递给 ABP 变量。
+	// 这样可以确保管理面 VIP 与 Cluster-Level 的端点主机名保持一致。
+	if scope.Cluster != nil {
+		if host := scope.Cluster.Spec.ControlPlaneEndpoint.Host; host != "" {
+			result["vip_mgmt"] = host
+		}
 	}
 
 	return result, nil
@@ -417,8 +485,13 @@ func (r *AnsibleConfigReconciler) nodeResourcesFromMachine(ctx context.Context, 
 	if infraMachine == nil {
 		return nil, nil
 	}
-	if nodeRes, found, _ := unstructured.NestedMap(infraMachine.Object, machineInfraNodeResourcesPath...); found && len(nodeRes) > 0 {
-		return cloneMap(nodeRes), nil
+	// 对接 CAPO：读取 spec.extensions.memory.reserved，生成 node_resources.
+	if valStr, found, _ := unstructured.NestedString(infraMachine.Object, "spec", "extensions", "memory", "reserved"); found && valStr != "" {
+		var memVal interface{} = valStr
+		if i, err := strconv.Atoi(valStr); err == nil {
+			memVal = i
+		}
+		return map[string]interface{}{"memory": memVal}, nil
 	}
 	return nil, nil
 }

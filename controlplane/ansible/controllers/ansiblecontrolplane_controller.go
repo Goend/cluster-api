@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"time"
 
+	"strings"
+
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/utils/ptr"
@@ -23,6 +27,7 @@ import (
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	controlplanev1alpha1 "sigs.k8s.io/cluster-api/controlplane/ansible/api/v1alpha1"
+	workloadprobe "sigs.k8s.io/cluster-api/controlplane/ansible/internal/workloadprobe"
 	"sigs.k8s.io/cluster-api/internal/ansiblecontract"
 	"sigs.k8s.io/cluster-api/internal/contract"
 	"sigs.k8s.io/cluster-api/util"
@@ -34,10 +39,12 @@ import (
 )
 
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch
 // AnsibleControlPlaneReconciler reconciles an AnsibleControlPlane object.
 type AnsibleControlPlaneReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	Probe  workloadprobe.WorkloadProbe
 }
 
 const (
@@ -108,6 +115,18 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	// 追加等待：在基础设施就绪后，确保 OpenStackCluster 的 APIServerLoadBalancer 就绪且 Bastion 处于 ACTIVE。
+	// 若不满足，仍以“基础设施未就绪”对外呈现，复用现有等待原因与消息。
+	if ok, err := r.ensureOpenStackInfraStatusReady(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	} else if !ok {
+		msg := "Cluster infrastructure bastion is not ready yet"
+		setACPCondition(acp, controlplanev1alpha1.CertificatesAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
+		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
+		setACPCondition(acp, clusterv1.ReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForClusterInfrastructureReason, msg)
+		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
 	if err := r.reconcileClusterCertificates(ctx, acp, cluster); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -117,6 +136,13 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		setACPCondition(acp, controlplanev1alpha1.KubeconfigAvailableCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
 		setACPCondition(acp, controlplanev1alpha1.PostBootstrapReadyCondition, metav1.ConditionFalse, controlplanev1alpha1.WaitingForControlPlaneEndpointReason, msg)
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	}
+
+	// Generate or reconcile the workload cluster kubeconfig as soon as
+	// certificates are available and the ControlPlaneEndpoint is valid.
+	// This intentionally avoids waiting for Node readiness, aligning with KCP.
+	if err := r.reconcileKubeconfig(ctx, acp, cluster); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.syncMachines(ctx, acp, cluster); err != nil {
@@ -167,6 +193,14 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 		return ctrl.Result{}, err
 	}
 
+	// Surface v1beta2-style controlPlaneInitialized based on remote API liveness (/livez).
+	if ptr := acp.Status.Initialization.ControlPlaneInitialized; ptr == nil || !*ptr {
+		if ok, _ := r.Probe.IsInitialized(ctx, r.Client, cluster); ok {
+			t := true
+			acp.Status.Initialization.ControlPlaneInitialized = &t
+		}
+	}
+
 	if err := conditions.SetSummaryCondition(acp, acp, string(clusterv1.ReadyCondition),
 		conditions.ForConditionTypes{
 			string(controlplanev1alpha1.CertificatesAvailableCondition),
@@ -186,12 +220,17 @@ func (r *AnsibleControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.
 
 // SetupWithManager wires the controller into the manager.
 func (r *AnsibleControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&controlplanev1alpha1.AnsibleControlPlane{}).
-        Owns(&clusterv1.Machine{}).
-        Owns(&bootstrapv1.AnsibleConfig{}).
-        Complete(r)
+	if r.Probe == nil {
+		r.Probe = workloadprobe.NewLivezProbe(0)
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&controlplanev1alpha1.AnsibleControlPlane{}).
+		Owns(&clusterv1.Machine{}).
+		Owns(&bootstrapv1.AnsibleConfig{}).
+		Complete(r)
 }
+
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=openstackclusters,verbs=get;list;watch
 
 func (r *AnsibleControlPlaneReconciler) updateReplicaStatus(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
 	selectorLabels := labels.Set{
@@ -252,6 +291,44 @@ func (r *AnsibleControlPlaneReconciler) reconcileDelete(ctx context.Context, acp
 		controllerutil.RemoveFinalizer(acp, controlplanev1alpha1.AnsibleControlPlaneFinalizer)
 	}
 	return ctrl.Result{}, nil
+}
+
+// ensureOpenStackInfraStatusReady 检查 OpenStackCluster 的关键状态：
+// 1) APIServerLoadBalancer 已分配内网 VIP（internalIP 非空）；
+// 2) 若启用了 bastion（spec.bastion.enabled=true），则 bastion.status.state 必须为 ACTIVE。
+// 返回 (true,nil) 表示满足条件；(false,nil) 表示需要继续等待；出错返回 (false,err)。
+func (r *AnsibleControlPlaneReconciler) ensureOpenStackInfraStatusReady(ctx context.Context, cluster *clusterv1.Cluster) (bool, error) {
+	ref := cluster.Spec.InfrastructureRef
+	if ref.APIGroup != "infrastructure.cluster.x-k8s.io" || ref.Kind != "OpenStackCluster" || ref.Name == "" {
+		return true, nil
+	}
+
+	var u unstructured.Unstructured
+	u.SetGroupVersionKind(schema.GroupVersionKind{Group: ref.APIGroup, Version: "v1beta1", Kind: ref.Kind})
+	if err := r.Client.Get(ctx, client.ObjectKey{Namespace: cluster.Namespace, Name: ref.Name}, &u); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	// 判断是否启用 bastion：spec.bastion.enabled 默认 true；若明确设为 false 则跳过等待
+	bastionEnabled := true
+	if bm, found, _ := unstructured.NestedMap(u.Object, "spec", "bastion"); found {
+		if v, ok := bm["enabled"].(bool); ok {
+			bastionEnabled = v
+		}
+	}
+	if !bastionEnabled {
+		return true, nil
+	}
+
+	// 若启用 bastion，则要求 status.bastion.state == ACTIVE
+	state, _, _ := unstructured.NestedString(u.Object, "status", "bastion", "state")
+	if !strings.EqualFold(state, "ACTIVE") {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (r *AnsibleControlPlaneReconciler) reconcileClusterCertificates(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
@@ -315,6 +392,8 @@ func (r *AnsibleControlPlaneReconciler) ensureKubeconfigMetadata(ctx context.Con
 	}
 	return nil
 }
+
+// remote API probe implemented in controlplane/ansible/internal/workloadprobe
 
 func (r *AnsibleControlPlaneReconciler) syncMachines(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
 	controlPlaneDesired := int32(1)
@@ -635,35 +714,35 @@ func (r *AnsibleControlPlaneReconciler) releaseInitLease(ctx context.Context, ac
 }
 
 func setACPCondition(acp *controlplanev1alpha1.AnsibleControlPlane, conditionType clusterv1.ConditionType, status metav1.ConditionStatus, reason, message string) {
-    // Ensure Reason is never empty to satisfy CRD validation (minLength>=1).
-    if reason == "" {
-        reason = defaultReasonFor(conditionType)
-    }
-    conditions.Set(acp, metav1.Condition{
-        Type:    string(conditionType),
-        Status:  status,
-        Reason:  reason,
-        Message: message,
-    })
+	// Ensure Reason is never empty to satisfy CRD validation (minLength>=1).
+	if reason == "" {
+		reason = defaultReasonFor(conditionType)
+	}
+	conditions.Set(acp, metav1.Condition{
+		Type:    string(conditionType),
+		Status:  status,
+		Reason:  reason,
+		Message: message,
+	})
 }
 
 // defaultReasonFor returns a stable, non-empty Reason for a given condition type
 // when callers don't specify one explicitly.
 func defaultReasonFor(conditionType clusterv1.ConditionType) string {
-    switch conditionType {
-    case controlplanev1alpha1.CertificatesAvailableCondition:
-        return controlplanev1alpha1.CertificatesAvailableReason
-    case controlplanev1alpha1.KubeconfigAvailableCondition:
-        return controlplanev1alpha1.KubeconfigGeneratedReason
-    case controlplanev1alpha1.MachinesCreatedCondition:
-        return controlplanev1alpha1.MachinesCreatedReason
-    case controlplanev1alpha1.PostBootstrapReadyCondition:
-        return controlplanev1alpha1.PostBootstrapCompletedReason
-    case clusterv1.ReadyCondition:
-        return "Reconciled"
-    default:
-        return "Reconciled"
-    }
+	switch conditionType {
+	case controlplanev1alpha1.CertificatesAvailableCondition:
+		return controlplanev1alpha1.CertificatesAvailableReason
+	case controlplanev1alpha1.KubeconfigAvailableCondition:
+		return controlplanev1alpha1.KubeconfigGeneratedReason
+	case controlplanev1alpha1.MachinesCreatedCondition:
+		return controlplanev1alpha1.MachinesCreatedReason
+	case controlplanev1alpha1.PostBootstrapReadyCondition:
+		return controlplanev1alpha1.PostBootstrapCompletedReason
+	case clusterv1.ReadyCondition:
+		return "Reconciled"
+	default:
+		return "Reconciled"
+	}
 }
 
 func (r *AnsibleControlPlaneReconciler) syncAnchorAnnotations(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {

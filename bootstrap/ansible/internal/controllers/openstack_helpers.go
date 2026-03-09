@@ -27,24 +27,25 @@ import (
 	ansiblecloudinit "sigs.k8s.io/cluster-api/bootstrap/ansible/internal/cloudinit"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/util"
+	client "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
 
 // 注意：本包使用 sigs.k8s.io/yaml 进行反序列化；该库会先将 YAML 转为 JSON 再用 encoding/json 反序列化，
 // 因此这里必须使用 json 标签而不是 yaml 标签，避免字段解析失败导致必填字段判空。
 type openStackCloudsFile struct {
-    Clouds map[string]openStackCloudEntry `json:"clouds"`
+	Clouds map[string]openStackCloudEntry `json:"clouds"`
 }
 
 type openStackCloudEntry struct {
-    Auth       openStackCloudAuth `json:"auth"`
-    RegionName string             `json:"region_name"`
+	Auth       openStackCloudAuth `json:"auth"`
+	RegionName string             `json:"region_name"`
 }
 
 type openStackCloudAuth struct {
-    AuthURL             string `json:"auth_url"`
-    AppCredentialID     string `json:"application_credential_id"`
-    AppCredentialSecret string `json:"application_credential_secret"`
+	AuthURL             string `json:"auth_url"`
+	AppCredentialID     string `json:"application_credential_id"`
+	AppCredentialSecret string `json:"application_credential_secret"`
 }
 
 func (r *AnsibleConfigReconciler) buildOpenStackAppCredentialFiles(ctx context.Context, scope *Scope) ([]ansiblecloudinit.File, error) {
@@ -145,4 +146,67 @@ func parseOpenStackCloudEntry(data []byte, primaryName string, fallbackName stri
 		return openStackCloudEntry{}, errors.Errorf("clouds.yaml missing cloud %s", primaryName)
 	}
 	return openStackCloudEntry{}, errors.New("clouds.yaml missing expected cloud entry")
+}
+
+// firstOpenStackClusterCIDR 收集 OpenStackCluster 在 status.network.subnets 中暴露的 CIDRs，
+// 返回找到的第一个非空 CIDR 字符串；未找到或非 OpenStack 基础设施则返回空串。
+func (r *AnsibleConfigReconciler) firstOpenStackClusterCIDR(ctx context.Context, scope *Scope) (string, error) {
+	if scope == nil || scope.Cluster == nil || !scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+		return "", nil
+	}
+	infraObj, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
+	if err != nil {
+		return "", err
+	}
+	if infraObj == nil {
+		return "", nil
+	}
+	// 读取 status.network.subnets[*].cidr
+	obj := infraObj.UnstructuredContent()
+	subnets, found, err := unstructured.NestedSlice(obj, "status", "network", "subnets")
+	if err != nil {
+		return "", err
+	}
+	if !found || len(subnets) == 0 {
+		return "", nil
+	}
+	for _, s := range subnets {
+		if m, ok := s.(map[string]interface{}); ok {
+			if cidr, foundCidr, _ := unstructured.NestedString(m, "cidr"); foundCidr && cidr != "" {
+				return cidr, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// firstOpenStackClusterCIDRFromClient 是 firstOpenStackClusterCIDR 的无接收者版本，
+// 方便在无 AnsibleConfigReconciler 实例的工具函数中复用。
+func firstOpenStackClusterCIDRFromClient(ctx context.Context, c client.Client, scope *Scope) (string, error) {
+	if scope == nil || scope.Cluster == nil || !scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+		return "", nil
+	}
+	infraObj, err := external.GetObjectFromContractVersionedRef(ctx, c, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
+	if err != nil {
+		return "", err
+	}
+	if infraObj == nil {
+		return "", nil
+	}
+	obj := infraObj.UnstructuredContent()
+	subnets, found, err := unstructured.NestedSlice(obj, "status", "network", "subnets")
+	if err != nil {
+		return "", err
+	}
+	if !found || len(subnets) == 0 {
+		return "", nil
+	}
+	for _, s := range subnets {
+		if m, ok := s.(map[string]interface{}); ok {
+			if cidr, foundCidr, _ := unstructured.NestedString(m, "cidr"); foundCidr && cidr != "" {
+				return cidr, nil
+			}
+		}
+	}
+	return "", nil
 }

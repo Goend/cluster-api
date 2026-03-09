@@ -88,6 +88,12 @@ type AnsibleControlPlaneStatus struct {
 	// +optional
 	Ready bool `json:"ready,omitempty"`
 
+	// Initialization contains granular initialization status for the control plane.
+	// In v1beta2 contract this includes controlPlaneInitialized which signals that
+	// the Kubernetes control plane has been initialized and is reachable.
+	// +optional
+	Initialization ACPInitializationStatus `json:"initialization,omitempty"`
+
 	// FailureReason summarizes terminal reconciliation failures, if any.
 	// +optional
 	FailureReason string `json:"failureReason,omitempty"`
@@ -102,6 +108,14 @@ type AnsibleControlPlaneStatus struct {
 	// +listMapKey=type
 	// +kubebuilder:validation:MaxItems=32
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ACPInitializationStatus captures initialization related flags for ACP (v1beta2-style).
+type ACPInitializationStatus struct {
+	// ControlPlaneInitialized is true when the control plane is initialized and reachable.
+	// This mirrors the v1beta2 contract field read by the Cluster controller.
+	// +optional
+	ControlPlaneInitialized *bool `json:"controlPlaneInitialized,omitempty"`
 }
 
 // +kubebuilder:object:root=true

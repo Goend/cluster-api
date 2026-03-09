@@ -32,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	ansiblecloudinit "sigs.k8s.io/cluster-api/bootstrap/ansible/internal/cloudinit"
 	"sigs.k8s.io/cluster-api/util"
 )
@@ -189,12 +188,13 @@ func buildSSHAuthSecret(scope *Scope, ref secretReference, namespace string, pri
 			corev1.SSHAuthPrivateKey: privateKey,
 		},
 	}
-	if namespace == scope.Config.Namespace {
+	// For a cluster-scoped shared SSH secret, use Cluster as the single controller owner.
+	if scope.Cluster != nil && namespace == scope.Config.Namespace {
 		secret.SetOwnerReferences(util.EnsureOwnerRef(nil, metav1.OwnerReference{
-			APIVersion: bootstrapv1.GroupVersion.String(),
-			Kind:       sshAuthSecretOwnerKind,
-			Name:       scope.Config.Name,
-			UID:        scope.Config.UID,
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Cluster",
+			Name:       scope.Cluster.Name,
+			UID:        scope.Cluster.UID,
 			Controller: ptr.To(true),
 		}))
 	}
@@ -214,17 +214,28 @@ func ensureSSHAuthSecretMetadata(secret *corev1.Secret, scope *Scope, namespace 
 		secret.Type = corev1.SecretTypeSSHAuth
 		updated = true
 	}
-	if namespace == scope.Config.Namespace {
-		ownerRef := metav1.OwnerReference{
-			APIVersion: bootstrapv1.GroupVersion.String(),
-			Kind:       sshAuthSecretOwnerKind,
-			Name:       scope.Config.Name,
-			UID:        scope.Config.UID,
+	if namespace == scope.Config.Namespace && scope.Cluster != nil {
+		// Ensure Cluster is the single controller owner.
+		controller := metav1.OwnerReference{
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Cluster",
+			Name:       scope.Cluster.Name,
+			UID:        scope.Cluster.UID,
 			Controller: ptr.To(true),
 		}
-		ownerRefs := util.EnsureOwnerRef(secret.GetOwnerReferences(), ownerRef)
-		if !reflect.DeepEqual(ownerRefs, secret.GetOwnerReferences()) {
-			secret.SetOwnerReferences(ownerRefs)
+		// Start from current refs, remove any other Controller=true entries, then ensure Cluster controller ref.
+		refs := secret.GetOwnerReferences()
+		filtered := make([]metav1.OwnerReference, 0, len(refs))
+		for _, r := range refs {
+			if r.Controller != nil && *r.Controller {
+				// drop existing controller owners; we'll enforce Cluster as controller
+				continue
+			}
+			filtered = append(filtered, r)
+		}
+		filtered = util.EnsureOwnerRef(filtered, controller)
+		if !reflect.DeepEqual(filtered, refs) {
+			secret.SetOwnerReferences(filtered)
 			updated = true
 		}
 	}

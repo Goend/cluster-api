@@ -42,4 +42,15 @@ const (
 	// an error while generating a data secret; those kind of errors are usually due to misconfigurations
 	// and user intervention is required to get them fixed.
 	DataSecretGenerationFailedReason = "DataSecretGenerationFailed"
+	// SSHConnectivityCondition documents whether the target machine is reachable via SSH using the bastion proxy.
+	SSHConnectivityCondition clusterv1.ConditionType = "SSHConnectivity"
+
+	// SSHReachableReason indicates SSH connectivity probe succeeded.
+	SSHReachableReason = "SSHReachable"
+	// SSHUnreachableReason indicates SSH probe failed to reach the target.
+	SSHUnreachableReason = "SSHUnreachable"
+	// SSHProbeErrorReason indicates an unexpected error occurred during probe.
+	SSHProbeErrorReason = "SSHProbeError"
+	// BastionNotFoundReason indicates the bastion Floating IP could not be resolved.
+	BastionNotFoundReason = "BastionNotFound"
 )

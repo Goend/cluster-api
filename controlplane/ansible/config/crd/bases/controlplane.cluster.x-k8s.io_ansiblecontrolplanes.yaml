@@ -273,7 +273,7 @@ spec:
                     type: array
                   varsConfigRefs:
                     description: |-
-                      VarsConfigRefs points to Config CRs that provide overrides for vars.yaml sections.
+                      VarsConfigRefs points to Config CRs that provide overrides for group_vars.yml sections.
                       The "business" and "fixed" references must be provided by the user to supply
                       environment-specific data, while "infra" is optional and defaults to an
                       auto-generated Config managed by the controller when omitted.
@@ -845,6 +845,18 @@ spec:
                 description: FailureReason summarizes terminal reconciliation failures,
                   if any.
                 type: string
+              initialization:
+                description: |-
+                  Initialization contains granular initialization status for the control plane.
+                  In v1beta2 contract this includes controlPlaneInitialized which signals that
+                  the Kubernetes control plane has been initialized and is reachable.
+                properties:
+                  controlPlaneInitialized:
+                    description: |-
+                      ControlPlaneInitialized is true when the control plane is initialized and reachable.
+                      This mirrors the v1beta2 contract field read by the Cluster controller.
+                    type: boolean
+                type: object
               initialized:
                 description: Initialized reports whether at least one control plane
                   instance finished bootstrap.

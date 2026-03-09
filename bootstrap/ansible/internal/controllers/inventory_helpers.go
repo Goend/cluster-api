@@ -1,19 +1,21 @@
 package controllers
 
 import (
-    "context"
-    "errors"
-    "fmt"
-    "sort"
-    "strings"
-    "time"
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
 
-    "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-    clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-    bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
-    "sigs.k8s.io/cluster-api/internal/ansiblecontract"
-    "sigs.k8s.io/yaml"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
+	"sigs.k8s.io/cluster-api/controllers/external"
+	"sigs.k8s.io/cluster-api/internal/ansiblecontract"
+	"sigs.k8s.io/yaml"
 )
 
 type inventoryNode struct {
@@ -95,11 +97,12 @@ func newInventoryNode(machine *clusterv1.Machine, ip string) inventoryNode {
 	}
 }
 
-func inventoryNodeFromMachine(machine *clusterv1.Machine) (inventoryNode, bool) {
+func inventoryNodeFromMachine(machine *clusterv1.Machine, PreferredCIDR string) (inventoryNode, bool) {
 	if machine == nil {
 		return inventoryNode{}, false
 	}
-	ip, err := selectMachineIPAddress(machine)
+	// 优先按 Scope.PreferredCIDR 过滤选择；失败时回退
+	ip, err := selectMachineIPAddress(machine, PreferredCIDR)
 	if err != nil || ip == "" {
 		return inventoryNode{}, false
 	}
@@ -129,143 +132,197 @@ func filterInventoryNodes(nodes []inventoryNode, keep func(inventoryNode) bool) 
 }
 
 func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope *Scope) (string, error) {
-    machine, err := machineFromScope(scope)
-    if err != nil {
-        return "", err
-    }
-    ip, err := selectMachineIPAddress(machine)
-    if err != nil {
-        return "", err
-    }
+	machine, err := machineFromScope(scope)
+	if err != nil {
+		return "", err
+	}
+	// 优先按 Scope.PreferredCIDR 过滤选择；失败时回退
+	ip, err := selectMachineIPAddress(machine, scope.PreferredCIDR)
+	if err != nil {
+		return "", err
+	}
 
-    hostNode := newInventoryNode(machine, ip)
-    isFirstMasterCluster := scope.ClusterOperationPlan.ActionType == bootstrapv1.ClusterOperationActionCluster
+	hostNode := newInventoryNode(machine, ip)
+	isFirstMasterCluster := scope.ClusterOperationPlan.ActionType == bootstrapv1.ClusterOperationActionCluster
 
-    // Collect hosts (primary + etcd anchors)
-    hostEntries := []inventoryNode{hostNode}
-    primaryAnchor, etcdAnchors, err := r.resolveInitialInventoryNodes(ctx, scope)
-    if err != nil {
-        return "", err
-    }
-    if primaryAnchor != nil {
-        hostEntries = addGroupMember(hostEntries, *primaryAnchor)
-    }
-    for _, node := range etcdAnchors {
-        hostEntries = addGroupMember(hostEntries, node)
-    }
+	// Collect hosts (primary + etcd anchors)
+	hostEntries := []inventoryNode{hostNode}
+	primaryAnchor, etcdAnchors, err := r.resolveInitialInventoryNodes(ctx, scope)
+	if err != nil {
+		return "", err
+	}
+	if primaryAnchor != nil {
+		hostEntries = addGroupMember(hostEntries, *primaryAnchor)
+	}
+	for _, node := range etcdAnchors {
+		hostEntries = addGroupMember(hostEntries, node)
+	}
 
-    // Build role membership (reuse existing logic)
-    hostRoles := normalizedRoles(scope.Config.Spec.Role)
-    groupMembers := map[string][]inventoryNode{}
+	// Build role membership (reuse existing logic)
+	hostRoles := normalizedRoles(scope.Config.Spec.Role)
+	groupMembers := map[string][]inventoryNode{}
 
-    if containsRole(hostRoles, "kube-master") {
-        groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], hostNode)
-    }
-    if primaryAnchor != nil {
-        groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], *primaryAnchor)
-    }
+	if containsRole(hostRoles, "kube-master") {
+		groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], hostNode)
+	}
+	if primaryAnchor != nil {
+		groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], *primaryAnchor)
+	}
 
-    if containsRole(hostRoles, "etcd") {
-        groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], hostNode)
-    }
-    for _, node := range etcdAnchors {
-        groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], node)
-    }
+	if containsRole(hostRoles, "etcd") {
+		groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], hostNode)
+	}
+	for _, node := range etcdAnchors {
+		groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], node)
+	}
 
-    for _, role := range hostRoles {
-        if role == "kube-master" || role == "etcd" {
-            continue
-        }
-        groupMembers[role] = addGroupMember(groupMembers[role], hostNode)
-    }
+	for _, role := range hostRoles {
+		if role == "kube-master" || role == "etcd" {
+			continue
+		}
+		groupMembers[role] = addGroupMember(groupMembers[role], hostNode)
+	}
 
-    kubeNodeMembers := groupMembers["kube-node"]
-    if isFirstMasterCluster {
-        kubeNodeMembers = filterInventoryNodes(kubeNodeMembers, func(node inventoryNode) bool {
-            if node.Name == hostNode.Name {
-                return false
-            }
-            for _, etcdNode := range etcdAnchors {
-                if node.Name == etcdNode.Name {
-                    return false
-                }
-            }
-            return true
-        })
-    } else {
-        kubeNodeMembers = addGroupMember(kubeNodeMembers, hostNode)
-        if primaryAnchor != nil {
-            kubeNodeMembers = addGroupMember(kubeNodeMembers, *primaryAnchor)
-        }
-        for _, etcdNode := range etcdAnchors {
-            kubeNodeMembers = addGroupMember(kubeNodeMembers, etcdNode)
-        }
-    }
-    groupMembers["kube-node"] = kubeNodeMembers
+	kubeNodeMembers := groupMembers["kube-node"]
+	if isFirstMasterCluster {
+		kubeNodeMembers = filterInventoryNodes(kubeNodeMembers, func(node inventoryNode) bool {
+			if node.Name == hostNode.Name {
+				return false
+			}
+			for _, etcdNode := range etcdAnchors {
+				if node.Name == etcdNode.Name {
+					return false
+				}
+			}
+			return true
+		})
+	} else {
 
-    // Assemble YAML inventory structure
-    all := map[string]interface{}{}
-    // hosts section
-    hosts := map[string]interface{}{}
-    seen := map[string]struct{}{}
-    for _, n := range hostEntries {
-        if n.Name == "" || n.IP == "" {
-            continue
-        }
-        if _, ok := seen[n.Name]; ok {
-            continue
-        }
-        seen[n.Name] = struct{}{}
-        hosts[n.Name] = map[string]interface{}{
-            "ip":            n.IP,
-            "access_ip":     n.IP,
-            "ansible_host":  n.IP,
-            // "ansible_connection": "ssh", // 如需固定可解除注释
-        }
-    }
-    if len(hosts) > 0 {
-        all["hosts"] = hosts
-    }
+		// 扩容阶段：kube-node 仅包含当前触发调谐的机器（hostNode）
+		kubeNodeMembers = addGroupMember(kubeNodeMembers, hostNode)
+	
+	}
+	groupMembers["kube-node"] = kubeNodeMembers
 
-    // children section (groups)
-    children := map[string]interface{}{}
-    // emit only non-empty role groups
-    for group, nodes := range groupMembers {
-        if len(nodes) == 0 {
-            continue
-        }
-        gh := map[string]interface{}{}
-        ghHosts := map[string]interface{}{}
-        for _, node := range nodes {
-            if node.Name == "" {
-                continue
-            }
-            ghHosts[node.Name] = map[string]interface{}{}
-        }
-        if len(ghHosts) > 0 {
-            gh["hosts"] = ghHosts
-        } else {
-            gh["hosts"] = map[string]interface{}{}
-        }
-        children[group] = gh
-    }
-    // k8s-cluster children referencing control plane and node groups
-    children["k8s-cluster"] = map[string]interface{}{
-        "children": map[string]interface{}{
-            "kube-master": map[string]interface{}{},
-            "kube-node":   map[string]interface{}{},
-        },
-    }
-    if len(children) > 0 {
-        all["children"] = children
-    }
+	// Assemble YAML inventory structure
+	all := map[string]interface{}{}
+	// hosts section
+	hosts := map[string]interface{}{}
+	seen := map[string]struct{}{}
+	for _, n := range hostEntries {
+		if n.Name == "" || n.IP == "" {
+			continue
+		}
+		if _, ok := seen[n.Name]; ok {
+			continue
+		}
+		seen[n.Name] = struct{}{}
+		hosts[n.Name] = map[string]interface{}{
+			"ip":               n.IP,
+			"access_ip":        n.IP,
+			"ansible_host":     n.IP,
+			"ansible_ssh_host": n.IP,
+			// "ansible_connection": "ssh", // 如需固定可解除注释
+		}
+	}
+	if len(hosts) > 0 {
+		all["hosts"] = hosts
+	}
 
-    root := map[string]interface{}{"all": all}
-    out, err := yaml.Marshal(root)
-    if err != nil {
-        return "", err
-    }
-    return string(out), nil
+	// Optionally add bastion as a host if a Floating IP is available
+	if fip, _ := r.bastionFIP(ctx, scope); fip != "" {
+		hosts["bastion"] = map[string]interface{}{
+			"ansible_host":     fip,
+			"ansible_ssh_host": fip,
+			"ansible_user":     "root",
+		}
+		all["hosts"] = hosts
+	}
+
+	// children section (groups)
+	children := map[string]interface{}{}
+	// emit only non-empty role groups first
+	for group, nodes := range groupMembers {
+		if len(nodes) == 0 {
+			continue
+		}
+		gh := map[string]interface{}{}
+		ghHosts := map[string]interface{}{}
+		for _, node := range nodes {
+			if node.Name == "" {
+				continue
+			}
+			ghHosts[node.Name] = map[string]interface{}{}
+		}
+		if len(ghHosts) > 0 {
+			gh["hosts"] = ghHosts
+		} else {
+			gh["hosts"] = map[string]interface{}{}
+		}
+		children[group] = gh
+	}
+	// ensure kube-node group is present even when empty (some playbooks expect the group to exist)
+	if _, exists := children["kube-node"]; !exists {
+		children["kube-node"] = map[string]interface{}{
+			"hosts": map[string]interface{}{},
+		}
+	}
+	// ensure work group  is present even when empty (some playbooks expect the group to exist)
+	for _, g := range []string{
+		"prometheus",
+		"ingress",
+		"harbor",
+		"nvidia-accelerator",
+		"hygon-accelerator",
+		"ascend-accelerator",
+		"esm",
+		"esm-ingress",
+		"esm-egress"} {
+		if _, exists := children[g]; !exists {
+			children[g] = map[string]interface{}{
+				"hosts": map[string]interface{}{},
+			}
+		}
+	}
+
+	// k8s-cluster children referencing control plane and node groups
+	children["k8s-cluster"] = map[string]interface{}{
+		"children": map[string]interface{}{
+			"kube-master": map[string]interface{}{},
+			"kube-node":   map[string]interface{}{},
+		},
+	}
+	if len(children) > 0 {
+		all["children"] = children
+	}
+
+	root := map[string]interface{}{"all": all}
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// bastionFIP tries to read bastion Floating IP from the infrastructure cluster object.
+func (r *AnsibleConfigReconciler) bastionFIP(ctx context.Context, scope *Scope) (string, error) {
+	if scope.Cluster == nil || !scope.Cluster.Spec.InfrastructureRef.IsDefined() {
+		return "", nil
+	}
+	infraObj, err := external.GetObjectFromContractVersionedRef(ctx, r.Client, scope.Cluster.Spec.InfrastructureRef, scope.Cluster.Namespace)
+	if err != nil || infraObj == nil {
+		return "", err
+	}
+	obj := infraObj.UnstructuredContent()
+	// Priority 1: public Floating IP
+	if v, found, _ := unstructured.NestedString(obj, "status", "bastion", "floatingIP"); found && v != "" {
+		return v, nil
+	}
+	// Priority 2: internal IP (layer-2 reachable environments)
+	if v, found, _ := unstructured.NestedString(obj, "status", "bastion", "ip"); found && v != "" {
+		return v, nil
+	}
+	return "", nil
 }
 
 func (r *AnsibleConfigReconciler) resolveInitialInventoryNodes(ctx context.Context, scope *Scope) (*inventoryNode, []inventoryNode, error) {
@@ -275,13 +332,13 @@ func (r *AnsibleConfigReconciler) resolveInitialInventoryNodes(ctx context.Conte
 	}
 
 	var controlPlaneNode *inventoryNode
-	if node, ok := inventoryNodeFromMachine(primaryMachine); ok {
+	if node, ok := inventoryNodeFromMachine(primaryMachine, scope.PreferredCIDR); ok {
 		controlPlaneNode = &node
 	}
 
 	etcdNodes := make([]inventoryNode, 0, len(etcdMachines))
 	for _, machine := range etcdMachines {
-		if node, ok := inventoryNodeFromMachine(machine); ok {
+		if node, ok := inventoryNodeFromMachine(machine, scope.PreferredCIDR); ok {
 			etcdNodes = addGroupMember(etcdNodes, node)
 		}
 	}
