@@ -16,8 +16,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/utils/ptr"
+	nameutils "sigs.k8s.io/cluster-api/controlplane/ansible/internal/utils"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -453,7 +453,9 @@ func (r *AnsibleControlPlaneReconciler) syncMachines(ctx context.Context, acp *c
 }
 
 func (r *AnsibleControlPlaneReconciler) createControlPlaneMachine(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) (string, error) {
-	machineName := names.SimpleNameGenerator.GenerateName(acp.Name + "-")
+	base := acp.Name + "-"
+	gen := nameutils.NewSequentialMachineNameGenerator(r.Client, acp.Namespace, cluster.Name)
+	machineName := gen.GenerateName(base)
 	labels := buildMachineLabels(acp, cluster)
 	annotations := buildMachineAnnotations(acp)
 
@@ -498,7 +500,9 @@ func (r *AnsibleControlPlaneReconciler) createControlPlaneMachine(ctx context.Co
 }
 
 func (r *AnsibleControlPlaneReconciler) createEtcdMachine(ctx context.Context, acp *controlplanev1alpha1.AnsibleControlPlane, cluster *clusterv1.Cluster) error {
-	machineName := names.SimpleNameGenerator.GenerateName(acp.Name + "-etcd-")
+	base := acp.Name + "-etcd-"
+	gen := nameutils.NewSequentialMachineNameGenerator(r.Client, acp.Namespace, cluster.Name)
+	machineName := gen.GenerateName(base)
 	labels := buildEtcdMachineLabels(acp, cluster)
 	annotations := buildMachineAnnotations(acp)
 

@@ -61,22 +61,31 @@ func parseScaleMasterAnnotation(annotations map[string]string) bool {
 }
 
 func (r *AnsibleConfigReconciler) ensureInitLockHolder(ctx context.Context, scope *Scope) (*ctrl.Result, error) {
-	if r.InitLock == nil {
-		return nil, errors.New("init lock is not configured")
-	}
-	machine, err := machineFromScope(scope)
+    if r.InitLock == nil {
+        return nil, errors.New("init lock is not configured")
+    }
+    machine, err := machineFromScope(scope)
 	if err != nil {
 		return nil, err
 	}
 	if machine == nil {
 		return nil, errors.New("machine owner is required to acquire init lock")
 	}
-	if !r.InitLock.Lock(ctx, scope.Cluster, machine) {
-		scope.Logger.Info("another control plane Machine is initializing, waiting for init lock", "machine", machine.Name)
-		return &ctrl.Result{RequeueAfter: initLockRetryInterval}, nil
-	}
-	scope.initLockHeld = true
-	return nil, nil
+    // 仅允许首台（名称字母序最小）尝试获取初始化锁，其它控制面直接等待首台。
+    first, err := firstControlPlaneName(ctx, r.Client, scope.Cluster.Namespace, scope.Cluster.Name)
+    if err != nil {
+        return nil, err
+    }
+    if machine.Name != first {
+        scope.Logger.Info("waiting for the first control plane Machine to acquire init lock", "first", first, "machine", machine.Name)
+        return &ctrl.Result{RequeueAfter: initLockRetryInterval}, nil
+    }
+    if !r.InitLock.Lock(ctx, scope.Cluster, machine) {
+        scope.Logger.Info("another control plane Machine is initializing, waiting for init lock", "machine", machine.Name)
+        return &ctrl.Result{RequeueAfter: initLockRetryInterval}, nil
+    }
+    scope.initLockHeld = true
+    return nil, nil
 }
 
 func (r *AnsibleConfigReconciler) releaseInitLock(ctx context.Context, scope *Scope) {

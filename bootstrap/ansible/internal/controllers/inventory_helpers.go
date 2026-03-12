@@ -15,7 +15,6 @@ import (
 	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	"sigs.k8s.io/cluster-api/internal/ansiblecontract"
-	"sigs.k8s.io/yaml"
 )
 
 type inventoryNode struct {
@@ -145,35 +144,68 @@ func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope
 	hostNode := newInventoryNode(machine, ip)
 	isFirstMasterCluster := scope.ClusterOperationPlan.ActionType == bootstrapv1.ClusterOperationActionCluster
 
-	// Collect hosts (primary + etcd anchors)
+	// Collect hosts: only current host + first init node (primaryAnchor preferred, else first etcd anchor)
 	hostEntries := []inventoryNode{hostNode}
 	primaryAnchor, etcdAnchors, err := r.resolveInitialInventoryNodes(ctx, scope)
 	if err != nil {
 		return "", err
 	}
+	// pick first init node
+	var firstInit *inventoryNode
 	if primaryAnchor != nil {
-		hostEntries = addGroupMember(hostEntries, *primaryAnchor)
+		firstInit = primaryAnchor
+	} else if len(etcdAnchors) > 0 {
+		firstInit = &etcdAnchors[0]
 	}
-	for _, node := range etcdAnchors {
-		hostEntries = addGroupMember(hostEntries, node)
+	if firstInit != nil {
+		hostEntries = addGroupMember(hostEntries, *firstInit)
+	}
+
+	// Collect other initialized control-plane masters (NodeInfo set), excluding firstInit and current host.
+	initializedCP := []inventoryNode{}
+	if cps, err2 := listSortedControlPlaneMachines(ctx, r.Client, scope.Cluster.Namespace, scope.Cluster.Name); err2 == nil && len(cps) > 0 {
+		for _, m := range cps {
+			if m == nil || m.Status.NodeInfo == nil {
+				continue
+			}
+			if m.Name == hostNode.Name || (firstInit != nil && m.Name == firstInit.Name) {
+				continue
+			}
+			if node, ok := inventoryNodeFromMachine(m, scope.PreferredCIDR); ok {
+				initializedCP = addGroupMember(initializedCP, node)
+				hostEntries = addGroupMember(hostEntries, node)
+			}
+		}
 	}
 
 	// Build role membership (reuse existing logic)
 	hostRoles := normalizedRoles(scope.Config.Spec.Role)
 	groupMembers := map[string][]inventoryNode{}
 
-	if containsRole(hostRoles, "kube-master") {
-		groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], hostNode)
-	}
-	if primaryAnchor != nil {
-		groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], *primaryAnchor)
-	}
+    // kube-master 组顺序：1) firstInit；2) 已初始化的其他 master；3) 本机（若具备 kube-master 角色）
+    if firstInit != nil {
+        groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], *firstInit)
+    }
+    if len(initializedCP) > 0 {
+        for _, n := range initializedCP {
+            groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], n)
+        }
+    }
+    if containsRole(hostRoles, "kube-master") {
+        groupMembers["kube-master"] = addGroupMember(groupMembers["kube-master"], hostNode)
+    }
 
+	// etcd 组顺序：1) firstInit；2) 已初始化的其他 master；3) 本机（若具备 etcd 角色）
+	if firstInit != nil {
+		groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], *firstInit)
+	}
+	if len(initializedCP) > 0 {
+		for _, n := range initializedCP {
+			groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], n)
+		}
+	}
 	if containsRole(hostRoles, "etcd") {
 		groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], hostNode)
-	}
-	for _, node := range etcdAnchors {
-		groupMembers["etcd"] = addGroupMember(groupMembers["etcd"], node)
 	}
 
 	for _, role := range hostRoles {
@@ -200,15 +232,62 @@ func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope
 
 		// 扩容阶段：kube-node 仅包含当前触发调谐的机器（hostNode）
 		kubeNodeMembers = addGroupMember(kubeNodeMembers, hostNode)
-	
+
 	}
 	groupMembers["kube-node"] = kubeNodeMembers
 
-	// Assemble YAML inventory structure
-	all := map[string]interface{}{}
+	// 以手工字符串渲染 YAML，确保组内主机顺序可控（首台 firstInit 在前）。
+	fip, _ := r.bastionFIP(ctx, scope)
+	return renderInventoryYAML(hostEntries, groupMembers, fip), nil
+}
+
+// renderInventoryYAML 以固定顺序输出 YAML，保证 kube-master/etcd 组内首台在前。
+func renderInventoryYAML(hostEntries []inventoryNode, groupMembers map[string][]inventoryNode, bastionFIP string) string {
+	b := &strings.Builder{}
+	wl := func(indent int, s string) {
+		b.WriteString(strings.Repeat("\t", 0))
+		b.WriteString(strings.Repeat(" ", indent))
+		b.WriteString(s)
+		b.WriteString("\n")
+	}
+
+	wl(0, "all:")
+
+	// children section first, with stable group order
+	wl(2, "children:")
+	groupOrder := []string{"etcd", "kube-master", "kube-node", "prometheus", "ingress", "harbor", "nvidia-accelerator", "hygon-accelerator", "ascend-accelerator", "esm", "esm-ingress", "esm-egress"}
+
+	for _, g := range groupOrder {
+		nodes := groupMembers[g]
+		wl(4, fmt.Sprintf("%s:", g))
+		wl(6, "hosts:")
+		if len(nodes) == 0 {
+			wl(8, "{}")
+			continue
+		}
+		for _, n := range nodes {
+			if n.Name == "" {
+				continue
+			}
+			wl(8, fmt.Sprintf("%s: {}", n.Name))
+		}
+	}
+
+	// k8s-cluster group
+	wl(4, "k8s-cluster:")
+	wl(6, "children:")
+	wl(8, "kube-master: {}")
+	wl(8, "kube-node: {}")
+
 	// hosts section
-	hosts := map[string]interface{}{}
+	wl(2, "hosts:")
 	seen := map[string]struct{}{}
+	if bastionFIP != "" {
+		wl(4, "bastion:")
+		wl(6, fmt.Sprintf("ansible_host: %s", bastionFIP))
+		wl(6, fmt.Sprintf("ansible_ssh_host: %s", bastionFIP))
+		wl(6, "ansible_user: root")
+	}
 	for _, n := range hostEntries {
 		if n.Name == "" || n.IP == "" {
 			continue
@@ -217,91 +296,13 @@ func (r *AnsibleConfigReconciler) buildHostsInventory(ctx context.Context, scope
 			continue
 		}
 		seen[n.Name] = struct{}{}
-		hosts[n.Name] = map[string]interface{}{
-			"ip":               n.IP,
-			"access_ip":        n.IP,
-			"ansible_host":     n.IP,
-			"ansible_ssh_host": n.IP,
-			// "ansible_connection": "ssh", // 如需固定可解除注释
-		}
+		wl(4, fmt.Sprintf("%s:", n.Name))
+		wl(6, fmt.Sprintf("access_ip: %s", n.IP))
+		wl(6, fmt.Sprintf("ansible_host: %s", n.IP))
+		wl(6, fmt.Sprintf("ansible_ssh_host: %s", n.IP))
+		wl(6, fmt.Sprintf("ip: %s", n.IP))
 	}
-	if len(hosts) > 0 {
-		all["hosts"] = hosts
-	}
-
-	// Optionally add bastion as a host if a Floating IP is available
-	if fip, _ := r.bastionFIP(ctx, scope); fip != "" {
-		hosts["bastion"] = map[string]interface{}{
-			"ansible_host":     fip,
-			"ansible_ssh_host": fip,
-			"ansible_user":     "root",
-		}
-		all["hosts"] = hosts
-	}
-
-	// children section (groups)
-	children := map[string]interface{}{}
-	// emit only non-empty role groups first
-	for group, nodes := range groupMembers {
-		if len(nodes) == 0 {
-			continue
-		}
-		gh := map[string]interface{}{}
-		ghHosts := map[string]interface{}{}
-		for _, node := range nodes {
-			if node.Name == "" {
-				continue
-			}
-			ghHosts[node.Name] = map[string]interface{}{}
-		}
-		if len(ghHosts) > 0 {
-			gh["hosts"] = ghHosts
-		} else {
-			gh["hosts"] = map[string]interface{}{}
-		}
-		children[group] = gh
-	}
-	// ensure kube-node group is present even when empty (some playbooks expect the group to exist)
-	if _, exists := children["kube-node"]; !exists {
-		children["kube-node"] = map[string]interface{}{
-			"hosts": map[string]interface{}{},
-		}
-	}
-	// ensure work group  is present even when empty (some playbooks expect the group to exist)
-	for _, g := range []string{
-		"prometheus",
-		"ingress",
-		"harbor",
-		"nvidia-accelerator",
-		"hygon-accelerator",
-		"ascend-accelerator",
-		"esm",
-		"esm-ingress",
-		"esm-egress"} {
-		if _, exists := children[g]; !exists {
-			children[g] = map[string]interface{}{
-				"hosts": map[string]interface{}{},
-			}
-		}
-	}
-
-	// k8s-cluster children referencing control plane and node groups
-	children["k8s-cluster"] = map[string]interface{}{
-		"children": map[string]interface{}{
-			"kube-master": map[string]interface{}{},
-			"kube-node":   map[string]interface{}{},
-		},
-	}
-	if len(children) > 0 {
-		all["children"] = children
-	}
-
-	root := map[string]interface{}{"all": all}
-	out, err := yaml.Marshal(root)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	return b.String()
 }
 
 // bastionFIP tries to read bastion Floating IP from the infrastructure cluster object.

@@ -73,15 +73,31 @@ func ensureSSHConnectivity(ctx context.Context, c client.Client, scope *Scope) (
 	}
 	defer bastionCli.Close()
 
-	// Try to open a TCP tunnel to target:22 via bastion; success means reachable
-	targetAddr := fmt.Sprintf("%s:22", targetIP)
-	ch, err := bastionCli.Dial("tcp", targetAddr)
-	if err != nil {
-		return false, bootstrapv1.SSHUnreachableReason, fmt.Sprintf("tunnel to %s failed: %v", targetAddr, err), nil
-	}
-	_ = ch.Close()
+    // Establish full SSH handshake to target via bastion (ProxyCommand-style),
+    // instead of only creating a TCP tunnel. This validates authentication and host key handling end-to-end.
+    targetAddr := fmt.Sprintf("%s:22", targetIP)
+    // 1) Open a TCP stream to target via bastion
+    ch, err := bastionCli.Dial("tcp", targetAddr)
+    if err != nil {
+        return false, bootstrapv1.SSHUnreachableReason, fmt.Sprintf("tunnel to %s failed: %v", targetAddr, err), nil
+    }
+    // 2) Run SSH handshake on that stream
+    tConn, chans, reqs, err := sshlib.NewClientConn(ch, targetAddr, cfg)
+    if err != nil {
+        // Close the underlying channel if handshake fails; NewClientConn does not close on error
+        _ = ch.Close()
+        return false, bootstrapv1.SSHUnreachableReason, fmt.Sprintf("ssh handshake to %s via bastion failed: %v", targetAddr, err), nil
+    }
+    tClient := sshlib.NewClient(tConn, chans, reqs)
+    defer tClient.Close()
+    // 3) Open a session to ensure we have permissions; no command execution required
+    sess, err := tClient.NewSession()
+    if err != nil {
+        return false, bootstrapv1.SSHUnreachableReason, fmt.Sprintf("open ssh session on %s failed: %v", targetAddr, err), nil
+    }
+    _ = sess.Close()
 
-	return true, bootstrapv1.SSHReachableReason, "", nil
+    return true, bootstrapv1.SSHReachableReason, "", nil
 }
 
 func setSSHConnectivityCondition(config *bootstrapv1.AnsibleConfig, status metav1.ConditionStatus, reason, message string) {

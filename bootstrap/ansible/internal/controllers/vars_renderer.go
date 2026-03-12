@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	bootstrapv1 "sigs.k8s.io/cluster-api/bootstrap/ansible/api/v1alpha1"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	configrenderer "sigs.k8s.io/cluster-api/controlplane/ansible/upstream/config"
 )
@@ -199,6 +200,12 @@ func (r *AnsibleConfigReconciler) renderVarsConfig(ctx context.Context, scope *S
 	merged = mergeSectionMaps(merged, infraSection)
 	merged = mergeSectionMaps(merged, businessSection)
 	merged = mergeSectionMaps(merged, fixedSection)
+
+	// 当执行扩容（scale.yml）且为融合架构（节点同时承担 kube-master 与 etcd 角色）时，传入 scale_master: "true"
+	isScale := scope.ClusterOperationPlan.ActionType == bootstrapv1.ClusterOperationActionScale
+	if isScale && hasMasterRole(scope.Config.Spec.Role) && hasEtcdRole(scope.Config.Spec.Role) {
+		merged["scale_master"] = "true"
+	}
 	if nr, ok := merged["node_resources"]; ok {
 		renderer.SetValue("__node_resources", nr)
 		delete(merged, "node_resources")

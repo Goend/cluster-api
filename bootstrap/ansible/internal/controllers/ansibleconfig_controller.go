@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
@@ -69,6 +70,30 @@ const (
 )
 
 var ansibleConfigGroupKind = bootstrapv1.GroupVersion.WithKind("AnsibleConfig").GroupKind()
+
+// errGatePending is a sentinel error used to indicate that bootstrap data generation
+// is intentionally deferred due to gating conditions (e.g., control-plane serialization
+// or waiting for all control-plane nodes to be ready). Callers should requeue without
+// setting failure conditions when encountering this error.
+var errGatePending = stderrors.New("bootstrap gate pending")
+
+// gatePendingError 用于在 "等待" 场景下携带具体原因，同时保持与 errGatePending 的 Is 兼容。
+type gatePendingError struct{ reason string }
+
+func (e gatePendingError) Error() string { return errGatePending.Error() + ": " + e.reason }
+func (e gatePendingError) Unwrap() error { return errGatePending }
+
+// newGatePendingError 构造一个带原因的等待错误。
+func newGatePendingError(reason string) error { return gatePendingError{reason: reason} }
+
+// gatePendingReason 从错误中解析出等待原因（若存在）。
+func gatePendingReason(err error) string {
+    var gp gatePendingError
+    if stderrors.As(err, &gp) {
+        return gp.reason
+    }
+    return ""
+}
 
 // InitLocker coordinates the first control plane initialization.
 type InitLocker interface {
@@ -333,13 +358,23 @@ func (r *AnsibleConfigReconciler) reconcile(ctx context.Context, scope *Scope, c
 		return ctrl.Result{}, nil
 	}
 
-	if !config.Status.Ready {
-		if err := r.reconcilePreBootstrap(ctx, scope); err != nil {
-			log.Error(err, "Failed to generate bootstrap data")
-			setDataSecretCondition(config, metav1.ConditionFalse, bootstrapv1.DataSecretGenerationFailedReason, err.Error())
-			return ctrl.Result{}, err
+		if !config.Status.Ready {
+			if err := r.reconcilePreBootstrap(ctx, scope); err != nil {
+				if stderrors.Is(err, errGatePending) {
+					log.Info("Bootstrap gated; waiting before retry",
+						"cluster", scope.Cluster.Name,
+						"ansibleConfig", klog.KRef(scope.Config.Namespace, scope.Config.Name),
+						"machine", func() string { m, _ := machineFromScope(scope); if m != nil { return m.Name }; return "" }(),
+						"reason", gatePendingReason(err),
+					)
+					// Gate is pending; do not mark as failure. Requeue after a delay.
+					return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+				}
+				log.Error(err, "Failed to generate bootstrap data")
+				setDataSecretCondition(config, metav1.ConditionFalse, bootstrapv1.DataSecretGenerationFailedReason, err.Error())
+				return ctrl.Result{}, err
+			}
 		}
-	}
 
 	result, err := r.reconcilePostBootstrap(ctx, scope)
 	if err != nil {
@@ -395,12 +430,78 @@ func (r *AnsibleConfigReconciler) storeBootstrapData(ctx context.Context, scope 
 }
 
 func (r *AnsibleConfigReconciler) reconcilePreBootstrap(ctx context.Context, scope *Scope) error {
+	// Gate bootstrap data generation to enforce serialized control-plane and delayed workers.
+	// 1) Control-plane Machines: allow only when previous control-plane NodeRef is set (strict serialization).
+	// 2) Non control-plane Machines: allow only when ALL control-plane Machines have NodeRef set.
+	machine, err := machineFromScope(scope)
+	if err != nil {
+		return err
+	}
+	if machine == nil {
+		return errors.New("machine owner is required to render bootstrap data")
+	}
+    if isControlPlane(machine) {
+        // 控制面序列化策略：
+        // - 若当前机器已持有 InitLock（来自上游 plan 阶段或本函数获取），则视作第一台控制面，直接放行；
+        // - 否则按照排序：索引 0 的机器尝试获取 InitLock，其他机器等待前一台 NodeRef 就绪。
+        cps, err := listSortedControlPlaneMachines(ctx, r.Client, scope.Cluster.Namespace, scope.Cluster.Name)
+        if err != nil {
+            return err
+        }
+        idx := indexOfMachine(cps, machine.Name)
+
+        if scope.initLockHeld {
+            // 已经持有初始化互斥锁：不要再等待排序上的“前一台”，避免与锁持有者相互卡住。
+            // 注意：此分支覆盖 idx>0 的情况（即便排序认为不是第一台，只要持锁就按第一台处理）。
+        } else if idx == 0 {
+            // 双重校验：确保只有名称字母序最小的机器尝试获取锁。
+            first, err := firstControlPlaneName(ctx, r.Client, scope.Cluster.Namespace, scope.Cluster.Name)
+            if err != nil {
+                return err
+            }
+            if machine.Name != first {
+                return newGatePendingError(fmt.Sprintf("waiting for first control-plane Machine: %s", first))
+            }
+            if r.InitLock == nil {
+                return errors.New("init lock is not configured")
+            }
+            if !r.InitLock.Lock(ctx, scope.Cluster, machine) {
+                // 另一台控制面正在进行初始化，等待。
+                return newGatePendingError("waiting for init lock (first control-plane)")
+            }
+            scope.initLockHeld = true
+        } else if idx > 0 {
+            prev := cps[idx-1]
+            if prev != nil && prev.Status.NodeInfo == nil {
+                // 非第一台控制面按顺序等待前一台 NodeRef。
+                return newGatePendingError(fmt.Sprintf("waiting for previous control-plane NodeRef: %s", prev.Name))
+            }
+        }
+    } else {
+        // Workers: ensure ALL control-plane Machines have NodeInfo set before proceeding.
+        cps, err := listSortedControlPlaneMachines(ctx, r.Client, scope.Cluster.Namespace, scope.Cluster.Name)
+        if err != nil {
+            return err
+        }
+			if len(cps) == 0 {
+				return newGatePendingError("waiting for control-plane machines to be created")
+			}
+			for _, cp := range cps {
+				if cp != nil && cp.DeletionTimestamp.IsZero() && cp.Status.NodeInfo == nil {
+					return newGatePendingError("waiting for all control-plane NodeRef to be set")
+				}
+			}
+        }
+
 	script, err := r.renderBootstrapData(ctx, scope)
 	if err != nil {
 		return err
 	}
 	return r.storeBootstrapData(ctx, scope, script)
 }
+
+// 备注：关于“上一台 ClusterOperation 是否 Succeeded 决定是否等待 NodeRef”的策略已取消，
+// 仅保留按 NodeRef 是否就绪的线性 gating。若未来需要恢复，请参考 git 历史中的实现草案。
 
 func (r *AnsibleConfigReconciler) renderBootstrapData(ctx context.Context, scope *Scope) ([]byte, error) {
 	certSecret, secretName, err := r.fetchCertificateSecret(ctx, scope)
@@ -421,25 +522,31 @@ func (r *AnsibleConfigReconciler) renderBootstrapData(ctx context.Context, scope
 		return nil, err
 	}
 	files = append(files, appCredFiles...)
-	sshAuthFile, err := r.buildSSHAuthorizedKeyFile(ctx, scope)
-	if err != nil {
-		return nil, err
-	}
-	if sshAuthFile != nil {
-		files = append(files, *sshAuthFile)
-	}
+    // Inject SSH public key for root via cloud-init users (preferred) to avoid
+    // depending on pre-existing /root/.ssh directory. Falls back silently if
+    // the SSH auth Secret isn't ready yet.
+    sshKeys, err := r.buildSSHAuthorizedKeys(ctx, scope)
+    if err != nil {
+        return nil, err
+    }
 	// TODO(goend): 临时创建 /etcd /kubelet /runtime 目录仅用于连通性与流程验证；
 	// 后续应由 CAPO 挂盘（RootVolume/AdditionalBlockDevices）和 ABP cloud-init 按实际挂载点初始化目录，
 	// 并去除此处占位命令，避免与真实挂载策略冲突。
 	// /etc/containerd 此路径理论上存在于最新的kylin镜像中 但最新的kylin镜像 缺少相关的cloud init能力
-	userData := &ansiblecloudinit.BaseUserData{
-		WriteFiles: files,
-		RunCommands: []string{
-			"mkdir -p /etcd /kubelet /runtime",
-			"yum remove containerd -y",
-			bootstrapCompleteCommand,
-		},
-	}
+    userData := &ansiblecloudinit.BaseUserData{
+        WriteFiles: files,
+        RunCommands: []string{
+            "mkdir -p /etcd /kubelet /runtime",
+            "yum remove containerd -y",
+            bootstrapCompleteCommand,
+        },
+    }
+    if len(sshKeys) > 0 {
+        userData.Users = []ansiblecloudinit.User{{
+            Name:              "root",
+            SSHAuthorizedKeys: sshKeys,
+        }}
+    }
 	rendered, err := ansiblecloudinit.Render(userData)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to render cloud-init for AnsibleConfig")
@@ -508,6 +615,22 @@ func (r *AnsibleConfigReconciler) reconcilePostBootstrap(ctx context.Context, sc
 	if err := r.applyResourceFromTemplate(ctx, scope, *scope.ClusterOperationTemplate); err != nil {
 		return ctrl.Result{}, err
 	}
+	// 在释放租约锁之前，等待 kubean Cluster 上的 refs（hostsConfRef、varsConfRef）就绪。
+	// 使用内联轮询而不是立即重排队；超时后再重排队，避免在临界区内让出锁。
+	scope.Logger.Info("Waiting for ClusterOperation refs to be populated (hostsConfRef/varsConfRef) with inline poll")
+	if err := wait.PollUntilContextTimeout(ctx, 3*time.Second, 15*time.Second, true, func(ctx context.Context) (bool, error) {
+		ready, err := r.refsReadyForClusterOperation(ctx, scope)
+		if err != nil {
+			return false, err
+		}
+		return ready, nil
+	}); err != nil {
+		if stderrors.Is(err, wait.ErrWaitTimeout) {
+			// 超时：不再继续等待，立即重排队（不延迟）。
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return ctrl.Result{}, err
+	}
 
 	if err := r.releaseHeldLocks(ctx, scope); err != nil {
 		return ctrl.Result{}, err
@@ -515,6 +638,56 @@ func (r *AnsibleConfigReconciler) reconcilePostBootstrap(ctx context.Context, sc
 
 	scope.Config.Status.PostBootstrapCompleted = true
 	return ctrl.Result{}, nil
+}
+
+// refsReadyForClusterOperation 检查刚创建的 ClusterOperation 是否已填充 hostsConfRef/varsConfRef。
+// 仅判断字段非空，不去校验所指向的对象是否存在。
+func (r *AnsibleConfigReconciler) refsReadyForClusterOperation(ctx context.Context, scope *Scope) (bool, error) {
+	if scope == nil || scope.ClusterOperationTemplate == nil {
+		return true, nil
+	}
+	tpl := scope.ClusterOperationTemplate
+	ns := tpl.Namespace
+	if ns == "" {
+		ns = scope.Config.Namespace
+	}
+	name := tpl.Name
+	if name == "" {
+		return true, nil
+	}
+	// 直接检查 ClusterOperation 上的各类 ref 是否被注入
+	co := &unstructured.Unstructured{}
+	co.SetAPIVersion(tpl.APIVersion)
+	co.SetKind(tpl.Kind)
+	key := types.NamespacedName{Namespace: ns, Name: name}
+	if err := r.Client.Get(ctx, key, co); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	specAny := co.UnstructuredContent()["spec"]
+	spec, ok := specAny.(map[string]interface{})
+	if !ok {
+		return false, nil
+	}
+	// 参考 kubean ClusterOperation API：支持 hostsConfRef / varsConfRef / sshAuthRef 三类可选 ref
+	// 只要其中的 name 非空，即视为已注入（通常至少需要 hostsConfRef 与 varsConfRef）。
+	hostName, hFound, _ := unstructured.NestedString(spec, "hostsConfRef", "name")
+	varsName, vFound, _ := unstructured.NestedString(spec, "varsConfRef", "name")
+	sshName, sFound, _ := unstructured.NestedString(spec, "sshAuthRef", "name")
+
+	// 判断规则：hostsConfRef 与 varsConfRef 均需存在且非空；sshAuthRef 若存在则 name 也需非空。
+	if !hFound || hostName == "" {
+		return false, nil
+	}
+	if !vFound || varsName == "" {
+		return false, nil
+	}
+	if sFound && sshName == "" {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (r *AnsibleConfigReconciler) applyResourceFromTemplate(ctx context.Context, scope *Scope, template bootstrapv1.ResourceTemplate) error {

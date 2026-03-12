@@ -3,6 +3,7 @@ package controllers
 import (
 	"context"
 	"net"
+	"sort"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -80,4 +81,61 @@ func machineFromScope(scope *Scope) (*clusterv1.Machine, error) {
 		return nil, errors.Wrap(err, "cannot convert ConfigOwner to Machine")
 	}
 	return machine, nil
+}
+
+// isControlPlane returns true if the Machine has the control-plane label.
+func isControlPlane(machine *clusterv1.Machine) bool {
+	if machine == nil {
+		return false
+	}
+	_, ok := machine.Labels[clusterv1.MachineControlPlaneLabel]
+	return ok
+}
+
+// listSortedControlPlaneMachines 列出指定集群的控制面 Machines，
+// 并按 Name 纯字母序升序排序，确保与“首台=名称字母序最小”规则一致且稳定。
+func listSortedControlPlaneMachines(ctx context.Context, c client.Client, namespace, clusterName string) ([]*clusterv1.Machine, error) {
+	ml := &clusterv1.MachineList{}
+	selectors := []client.ListOption{
+		client.InNamespace(namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName, clusterv1.MachineControlPlaneLabel: ""},
+	}
+	if err := c.List(ctx, ml, selectors...); err != nil {
+		return nil, err
+	}
+	items := make([]*clusterv1.Machine, 0, len(ml.Items))
+	for i := range ml.Items {
+		m := ml.Items[i].DeepCopy()
+		items = append(items, m)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
+	return items, nil
+}
+
+// firstControlPlaneName 返回名称字母序最小的控制面机器名称；若不存在返回空串。
+func firstControlPlaneName(ctx context.Context, c client.Client, namespace, clusterName string) (string, error) {
+	cps, err := listSortedControlPlaneMachines(ctx, c, namespace, clusterName)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range cps {
+		if m == nil {
+			continue
+		}
+		if !m.DeletionTimestamp.IsZero() {
+			continue
+		}
+		return m.Name, nil
+	}
+	return "", nil
+}
+
+// indexOfMachine returns the index of the given machine name in the list, or -1 if not found.
+func indexOfMachine(list []*clusterv1.Machine, name string) int {
+	for i, m := range list {
+		if m != nil && m.Name == name {
+			return i
+		}
+	}
+	return -1
 }

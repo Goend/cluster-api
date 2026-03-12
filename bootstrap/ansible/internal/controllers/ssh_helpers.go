@@ -129,6 +129,48 @@ func (r *AnsibleConfigReconciler) buildSSHAuthorizedKeyFile(ctx context.Context,
 	return sshAuthorizedKeyFileFromSecret(secret, ref.Namespace, ref.Name)
 }
 
+// buildSSHAuthorizedKeys returns a slice of public keys (in authorized_keys format)
+// derived from the ssh-auth Secret referenced by the Cluster template. It ensures
+// the Secret exists (creating one with a generated key if absent) and then
+// converts the private key to its public key form. If the reference is missing
+// or the Secret isn't ready yet, it returns an empty slice without error so
+// callers can proceed gracefully.
+func (r *AnsibleConfigReconciler) buildSSHAuthorizedKeys(ctx context.Context, scope *Scope) ([]string, error) {
+    ref, err := sshAuthSecretRefFromTemplate(scope)
+    if err != nil {
+        return nil, err
+    }
+    if ref.Name == "" {
+        return nil, nil
+    }
+    ready, err := r.ensureSSHAuthSecretWithLock(ctx, scope, ref, false)
+    if err != nil {
+        return nil, err
+    }
+    if !ready {
+        return nil, nil
+    }
+
+    secret, err := r.fetchSSHAuthSecret(ctx, ref.Namespace, ref.Name)
+    if err != nil {
+        return nil, errors.Wrapf(err, "failed to get SSH auth Secret %s/%s", ref.Namespace, ref.Name)
+    }
+    priv, err := sshAuthPrivateKeyFromSecret(secret, ref.Namespace, ref.Name)
+    if err != nil {
+        return nil, err
+    }
+    pub, err := deriveSSHPublicKey(priv)
+    if err != nil {
+        return nil, err
+    }
+    // Normalize to a single line without trailing newline; cloud-init will handle line breaks.
+    key := string(pub)
+    if len(key) > 0 && key[len(key)-1] == '\n' {
+        key = key[:len(key)-1]
+    }
+    return []string{key}, nil
+}
+
 func (r *AnsibleConfigReconciler) fetchSSHAuthSecret(ctx context.Context, namespace, name string) (*corev1.Secret, error) {
 	secret := &corev1.Secret{}
 	key := types.NamespacedName{Namespace: namespace, Name: name}
